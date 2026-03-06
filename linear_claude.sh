@@ -1,10 +1,10 @@
 #!/bin/bash
 
-LC_VERSION="v0.1.0"
+LC_VERSION="v0.1.1"
 
 LC_ADDITIONAL_FLAGS="--output-format stream-json --verbose"
 
-LC_NOTES_FILE="SHARED_TASK_NOTES.md"
+LC_NOTES_DIR="./.claude/plans"
 
 LC_PROMPT_JQ_INSTALL="Please install jq for JSON parsing"
 
@@ -22,9 +22,6 @@ This is part of a continuous development loop where work happens incrementally a
 
 ## PRIMARY GOAL"
 
-LC_PROMPT_NOTES_UPDATE_EXISTING="Update the \`$LC_NOTES_FILE\` file with relevant context for the next iteration. Add new notes and remove outdated information to keep it current and useful."
-
-LC_PROMPT_NOTES_CREATE_NEW="Create a \`$LC_NOTES_FILE\` file with relevant context and instructions for the next iteration."
 
 LC_PROMPT_NOTES_GUIDELINES="
 
@@ -423,7 +420,7 @@ OPTIONS:
     --disable-commits             Disable automatic commits and PR creation
     --disable-branches            Commit on current branch without creating branches or PRs
     --git-branch-prefix <prefix>  Branch prefix for iterations (default: "linear-claude/")
-    --notes-file <file>           Shared notes file for iteration context (default: "SHARED_TASK_NOTES.md")
+    --notes-dir <dir>             Directory for per-ticket notes files (default: "./.claude/plans")
     --dry-run                     Simulate execution without making changes
     --completion-signal <phrase>  Phrase that agents output when project is complete (default: "LINEAR_CLAUDE_PROJECT_COMPLETE")
     --completion-threshold <num>  Number of consecutive signals to stop early (default: 3)
@@ -531,8 +528,8 @@ parse_arguments() {
                 LC_DISABLE_BRANCHES=true
                 shift
                 ;;
-            --notes-file)
-                LC_NOTES_FILE="$2"
+            --notes-dir)
+                LC_NOTES_DIR="$2"
                 shift 2
                 ;;
             --dry-run)
@@ -795,8 +792,14 @@ linear_claude_commit() {
             echo "🔄 $iteration_display Commit retry $commit_attempts/$max_commit_attempts..." >&2
         fi
 
+        local commit_prompt="$LC_PROMPT_COMMIT_MESSAGE"
+        if [ $commit_attempts -eq $max_commit_attempts ]; then
+            echo "⚠️  $iteration_display Last attempt — using --no-verify to skip pre-commit hooks" >&2
+            commit_prompt="$LC_PROMPT_COMMIT_MESSAGE Use the --no-verify flag when committing (e.g., git commit --no-verify -m \"...\") to skip pre-commit hooks."
+        fi
+
         local commit_output
-        commit_output=$(claude -p "$LC_PROMPT_COMMIT_MESSAGE" --allowedTools "Bash(git)" 2>&1)
+        commit_output=$(claude -p "$commit_prompt" --allowedTools "Bash(git)" 2>&1)
         local commit_exit=$?
 
         if [ $commit_exit -ne 0 ]; then
@@ -849,7 +852,7 @@ linear_claude_commit() {
     if [ "$LC_OPEN_PR" = "true" ]; then
         echo "🔨 $iteration_display Creating pull request..." >&2
         local pr_output
-        if ! pr_output=$(gh pr create --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch" 2>&1); then
+        if ! pr_output=$(gh pr create --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch" --draft 2>&1); then
             echo "⚠️  $iteration_display Failed to create PR: $pr_output" >&2
             # Not fatal — branch was pushed successfully
         else
@@ -921,8 +924,14 @@ commit_on_current_branch() {
             echo "🔄 $iteration_display Commit retry $commit_attempts/$max_commit_attempts..." >&2
         fi
 
+        local commit_prompt="$LC_PROMPT_COMMIT_MESSAGE"
+        if [ $commit_attempts -eq $max_commit_attempts ]; then
+            echo "⚠️  $iteration_display Last attempt — using --no-verify to skip pre-commit hooks" >&2
+            commit_prompt="$LC_PROMPT_COMMIT_MESSAGE Use the --no-verify flag when committing (e.g., git commit --no-verify -m \"...\") to skip pre-commit hooks."
+        fi
+
         local commit_output
-        commit_output=$(claude -p "$LC_PROMPT_COMMIT_MESSAGE" --allowedTools "Bash(git)" 2>&1)
+        commit_output=$(claude -p "$commit_prompt" --allowedTools "Bash(git)" 2>&1)
         local commit_exit=$?
 
         if [ $commit_exit -ne 0 ]; then
@@ -1399,7 +1408,7 @@ execute_single_iteration() {
     local iteration_num=$1
     local override_branch="$2"
     local identifier="${3:-iteration-${iteration_num}}"
-    local notes_file="./.claude/plans/${identifier}.md"
+    local notes_file="${LC_NOTES_DIR}/${identifier}.md"
 
     local iteration_display=$(get_iteration_display $iteration_num "${LC_MAX_RUNS:-0}" $extra_iterations)
     echo "🔄 $iteration_display Starting iteration..." >&2
@@ -1419,7 +1428,7 @@ execute_single_iteration() {
         fi
     fi
 
-    mkdir -p ./.claude/plans
+    mkdir -p "$LC_NOTES_DIR"
 
     local max_question_rounds=3
     local question_round=0
@@ -1482,9 +1491,9 @@ $accumulated_answers
             return 1
         fi
 
-        # Save result to .claude/plans/
+        # Save result to notes dir
         if [ -n "$result" ]; then
-            echo "$result" > "./.claude/plans/$(date +%Y%m%d-%H%M%S)-${identifier}.json"
+            echo "$result" > "${LC_NOTES_DIR}/$(date +%Y%m%d-%H%M%S)-${identifier}.json"
         fi
 
         local parse_result=$(parse_claude_result "$result")
@@ -1742,8 +1751,8 @@ $conversation_comments"
 
     # Save result
     if [ -n "$result" ]; then
-        mkdir -p ./.claude/plans
-        echo "$result" > "./.claude/plans/$(date +%Y%m%d-%H%M%S)-${identifier}-review.json"
+        mkdir -p "$LC_NOTES_DIR"
+        echo "$result" > "${LC_NOTES_DIR}/$(date +%Y%m%d-%H%M%S)-${identifier}-review.json"
     fi
 
     if [ $claude_exit_code -ne 0 ]; then
@@ -2016,7 +2025,7 @@ cmd_view() {
     LC_ERROR_LOG=$(mktemp)
     LC_INTERRUPTED=false
     LC_CLAUDE_PID_FILE=$(mktemp)
-    trap 'LC_INTERRUPTED=true; echo "" >&2; echo "⛔ Interrupted — killing claude and exiting..." >&2; LC_TRAP_PID=$(cat "$LC_CLAUDE_PID_FILE" 2>/dev/null); if [ -n "$LC_TRAP_PID" ] && kill -0 "$LC_TRAP_PID" 2>/dev/null; then kill "$LC_TRAP_PID" 2>/dev/null; fi' INT TERM
+    trap 'echo "" >&2; echo "⛔ Interrupted — killing claude and exiting..." >&2; LC_TRAP_PID=$(cat "$LC_CLAUDE_PID_FILE" 2>/dev/null); if [ -n "$LC_TRAP_PID" ] && kill -0 "$LC_TRAP_PID" 2>/dev/null; then kill "$LC_TRAP_PID" 2>/dev/null; fi; exit 130' INT TERM
     trap "rm -f $LC_ERROR_LOG $LC_CLAUDE_PID_FILE" EXIT
 
     fetch_linear_view_issues || exit 1
