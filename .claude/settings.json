@@ -897,6 +897,7 @@
         "mcp__linear__list_issues",
         "WebFetch(domain:linear.app)",
         "Bash(linear:*)",
+        "Bash(bash linear_claude.sh:*)",
         "mcp__linear__save_issue"
       ],
       "deny": [
@@ -1049,7 +1050,7 @@
         "Bash(exec > /dev/tcp/*)",
         "Bash(exec 3<>/dev/tcp/*)"
       ],
-      "defaultMode": "acceptEdits"
+      "defaultMode": "plan"
     },
     "enabledMcpjsonServers": [
       "linear"

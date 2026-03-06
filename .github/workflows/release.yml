@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify version matches tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          SCRIPT_VERSION=$(grep -m1 '^LC_VERSION=' linear_claude.sh | cut -d'"' -f2)
+          if [ "$TAG" != "$SCRIPT_VERSION" ]; then
+            echo "::error::Tag ($TAG) does not match LC_VERSION in script ($SCRIPT_VERSION)"
+            exit 1
+          fi
+          echo "VERSION=$TAG" >> "$GITHUB_ENV"
+
+      - name: Compute SHA256
+        run: |
+          sha256sum linear_claude.sh > linear_claude.sh.sha256
+          echo "SHA256 checksum:"
+          cat linear_claude.sh.sha256
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.' | sed -n '2p')
+          if [ -n "$PREV_TAG" ]; then
+            echo "## Changes since $PREV_TAG" > changelog.md
+            echo "" >> changelog.md
+            git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+          else
+            echo "## Initial Release" > changelog.md
+            echo "" >> changelog.md
+            git log --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+          fi
+          echo ""
+          echo "--- Changelog ---"
+          cat changelog.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes-file changelog.md \
+            linear_claude.sh \
+            linear_claude.sh.sha256

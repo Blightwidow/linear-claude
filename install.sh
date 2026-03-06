@@ -19,7 +19,7 @@ mkdir -p "$INSTALL_DIR"
 
 # Download the script
 echo "📥 Downloading $BINARY_NAME..."
-if ! curl -fsSL "$REPO_URL/continuous_claude.sh" -o "$INSTALL_DIR/$BINARY_NAME"; then
+if ! curl -fsSL "$REPO_URL/linear_claude.sh" -o "$INSTALL_DIR/$BINARY_NAME"; then
     echo -e "${RED}❌ Failed to download $BINARY_NAME${NC}" >&2
     exit 1
 fi
@@ -95,6 +95,6 @@ echo ""
 echo -e "${GREEN}🎉 Installation complete!${NC}"
 echo ""
 echo "Get started with:"
-echo "  $BINARY_NAME \"https://linear.app/team/view/your-view-id\""
+echo "  $BINARY_NAME view \"https://linear.app/team/view/your-view-id\""
 echo ""
 echo "For more information, visit: https://github.com/Blightwidow/linear-claude"

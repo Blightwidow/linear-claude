@@ -53,28 +53,34 @@ sudo rm /usr/local/bin/linear-claude
 
 ```bash
 # Run one iteration per issue from a Linear view (owner and repo auto-detected from git remote)
-linear-claude "https://linear.app/team/view/abc123"
+linear-claude view "https://linear.app/team/view/abc123"
 
 # Or use just the view ID
-linear-claude abc123
+linear-claude view abc123
 
 # Limit processing to 3 issues and $10
-linear-claude abc123 -m 3 --max-cost 10.00
+linear-claude view abc123 -m 3 --max-cost 10.00
 
 # Run for a maximum duration
-linear-claude abc123 --max-duration 2h
+linear-claude view abc123 --max-duration 2h
 
 # Open PRs for each issue
-linear-claude abc123 --open-pr
+linear-claude view abc123 --open-pr
 
 # Run without commits (testing mode)
-linear-claude abc123 --disable-commits
+linear-claude view abc123 --disable-commits
 
 # Dry run
-linear-claude abc123 --dry-run
+linear-claude view abc123 --dry-run
+
+# Update to the latest version
+linear-claude update
+
+# Show version
+linear-claude version
 ```
 
-## 🎯 Flags
+## 🎯 View Flags
 
 * `-m, --max-runs <number>`: Maximum number of successful iterations (use `0` for unlimited with `--max-cost` or `--max-duration`)
 * `--max-cost <dollars>`: Maximum USD to spend
@@ -114,8 +120,8 @@ Any additional flags not recognized by `linear-claude` are forwarded to the unde
 ✅ (1) Pushed branch: linear-claude/iteration-1/2025-11-15-be939873
 
 📋 Processing issue 2/4: PROJ-43 — Fix login redirect (state: In Review)
-🔍 (2) Handling review for PROJ-43 (theo/fix-login-redirect)...
-📋 (2) Found PR #12 from Linear for branch theo/fix-login-redirect
+🔍 (2) Handling review for PROJ-43 (user/fix-login-redirect)...
+📋 (2) Found PR #12 from Linear for branch user/fix-login-redirect
 🔄 (2) Checking CI status for PR #12...
 🤖 (2) Running Claude Code to resolve review comments...
 ✅ (2) Review comments addressed for PROJ-43

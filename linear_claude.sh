@@ -70,6 +70,10 @@ start_time=""
 LC_LINEAR_VIEW=""
 LC_LINEAR_ISSUES_JSON=""
 LC_OPEN_PR=false
+LC_GITHUB_RELEASE_REPO="Blightwidow/linear-claude"
+LC_UPDATE_CACHE_DIR="$HOME/.cache/linear-claude"
+LC_UPDATE_CACHE_FILE="$HOME/.cache/linear-claude/latest-version"
+LC_UPDATE_CACHE_MAX_AGE=86400  # 24 hours in seconds
 
 parse_duration() {
     local duration_str="$1"
@@ -138,19 +142,279 @@ format_duration() {
     echo "$result"
 }
 
+version_lt() {
+    local a="$1" b="$2"
+    # Strip leading 'v' if present
+    a="${a#v}"
+    b="${b#v}"
+
+    local IFS='.'
+    local -a a_parts=($a) b_parts=($b)
+
+    local max=${#a_parts[@]}
+    if [ ${#b_parts[@]} -gt $max ]; then
+        max=${#b_parts[@]}
+    fi
+
+    local i=0
+    while [ $i -lt $max ]; do
+        local a_num=${a_parts[$i]:-0}
+        local b_num=${b_parts[$i]:-0}
+        if [ "$a_num" -lt "$b_num" ] 2>/dev/null; then
+            return 0  # a < b
+        elif [ "$a_num" -gt "$b_num" ] 2>/dev/null; then
+            return 1  # a > b
+        fi
+        i=$((i + 1))
+    done
+
+    return 1  # equal, not less than
+}
+
+compute_sha256() {
+    local file="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | cut -d' ' -f1
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | cut -d' ' -f1
+    else
+        echo ""
+        return 1
+    fi
+}
+
+check_for_updates() {
+    # Check if cache exists and is fresh enough
+    if [ -f "$LC_UPDATE_CACHE_FILE" ]; then
+        local cache_time
+        cache_time=$(head -n 1 "$LC_UPDATE_CACHE_FILE" 2>/dev/null || echo "0")
+        local now
+        now=$(date +%s)
+        local age=$((now - cache_time))
+        if [ "$age" -lt "$LC_UPDATE_CACHE_MAX_AGE" ]; then
+            # Cache is fresh, read cached version
+            local cached_version
+            cached_version=$(sed -n '2p' "$LC_UPDATE_CACHE_FILE" 2>/dev/null || echo "")
+            if [ -n "$cached_version" ] && version_lt "$LC_VERSION" "$cached_version"; then
+                echo "⚠️  A newer version of linear-claude is available: $cached_version (current: $LC_VERSION)" >&2
+                echo "   Run 'linear-claude update' to upgrade." >&2
+                echo "" >&2
+            fi
+            return 0
+        fi
+    fi
+
+    # Fetch latest release from GitHub API (3s timeout, no jq dependency)
+    local response
+    response=$(curl -fsSL --connect-timeout 3 --max-time 5 \
+        "https://api.github.com/repos/$LC_GITHUB_RELEASE_REPO/releases/latest" 2>/dev/null) || return 0
+
+    local latest_tag
+    latest_tag=$(echo "$response" | grep '"tag_name"' | head -n 1 | cut -d'"' -f4)
+
+    if [ -z "$latest_tag" ]; then
+        return 0
+    fi
+
+    # Update cache
+    mkdir -p "$LC_UPDATE_CACHE_DIR" 2>/dev/null || return 0
+    printf '%s\n%s\n' "$(date +%s)" "$latest_tag" > "$LC_UPDATE_CACHE_FILE" 2>/dev/null || true
+
+    if version_lt "$LC_VERSION" "$latest_tag"; then
+        echo "⚠️  A newer version of linear-claude is available: $latest_tag (current: $LC_VERSION)" >&2
+        echo "   Run 'linear-claude update' to upgrade." >&2
+        echo "" >&2
+    fi
+}
+
+show_update_help() {
+    cat << 'EOF'
+Linear Claude — Update
+
+USAGE:
+    linear-claude update [options]
+
+DESCRIPTION:
+    Downloads and installs the latest version of linear-claude from GitHub releases.
+    Verifies the download integrity via SHA256 checksum.
+
+OPTIONS:
+    -h, --help    Show this help message
+EOF
+}
+
+cmd_update() {
+    # Parse update-specific flags
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_update_help
+                return 0
+                ;;
+            *)
+                echo "❌ Unknown option for update: $1" >&2
+                echo "Run 'linear-claude update --help' for usage." >&2
+                return 1
+                ;;
+        esac
+    done
+
+    echo "🔄 Checking for updates..." >&2
+
+    # Fetch latest release info
+    local response
+    response=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/$LC_GITHUB_RELEASE_REPO/releases/latest" 2>/dev/null)
+
+    if [ -z "$response" ]; then
+        echo "❌ Failed to fetch release information from GitHub." >&2
+        echo "   Check your internet connection or try again later." >&2
+        return 1
+    fi
+
+    local latest_tag
+    latest_tag=$(echo "$response" | grep '"tag_name"' | head -n 1 | cut -d'"' -f4)
+
+    if [ -z "$latest_tag" ]; then
+        echo "❌ No releases found for $LC_GITHUB_RELEASE_REPO." >&2
+        return 1
+    fi
+
+    if ! version_lt "$LC_VERSION" "$latest_tag"; then
+        echo "✅ Already up to date (version $LC_VERSION)." >&2
+        return 0
+    fi
+
+    echo "📦 Updating from $LC_VERSION to $latest_tag..." >&2
+
+    # Determine download URLs from release assets
+    local script_url
+    script_url=$(echo "$response" | grep '"browser_download_url"' | grep 'linear_claude\.sh"' | head -n 1 | cut -d'"' -f4)
+    local checksum_url
+    checksum_url=$(echo "$response" | grep '"browser_download_url"' | grep 'linear_claude\.sh\.sha256"' | head -n 1 | cut -d'"' -f4)
+
+    if [ -z "$script_url" ]; then
+        echo "❌ Could not find linear_claude.sh in release assets." >&2
+        return 1
+    fi
+
+    # Download to temp files
+    local tmp_script
+    tmp_script=$(mktemp)
+    local tmp_checksum
+    tmp_checksum=$(mktemp)
+    trap "rm -f '$tmp_script' '$tmp_checksum'" RETURN
+
+    echo "📥 Downloading linear_claude.sh..." >&2
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 "$script_url" -o "$tmp_script"; then
+        echo "❌ Failed to download linear_claude.sh" >&2
+        return 1
+    fi
+
+    # Verify checksum if available
+    if [ -n "$checksum_url" ]; then
+        echo "🔐 Verifying checksum..." >&2
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 "$checksum_url" -o "$tmp_checksum"; then
+            echo "❌ Failed to download checksum file" >&2
+            return 1
+        fi
+
+        local expected_sha
+        expected_sha=$(cut -d' ' -f1 < "$tmp_checksum")
+        local actual_sha
+        actual_sha=$(compute_sha256 "$tmp_script")
+
+        if [ -z "$actual_sha" ]; then
+            echo "❌ Could not compute SHA256 — neither shasum nor sha256sum found." >&2
+            return 1
+        fi
+
+        if [ "$expected_sha" != "$actual_sha" ]; then
+            echo "❌ Checksum verification failed!" >&2
+            echo "   Expected: $expected_sha" >&2
+            echo "   Got:      $actual_sha" >&2
+            return 1
+        fi
+
+        echo "✅ Checksum verified." >&2
+    else
+        echo "⚠️  No checksum file in release assets, skipping verification." >&2
+    fi
+
+    # Determine install path
+    local install_path
+    install_path=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || command -v linear-claude 2>/dev/null || echo "")
+
+    if [ -z "$install_path" ]; then
+        echo "❌ Could not determine install location." >&2
+        echo "   Download manually from: https://github.com/$LC_GITHUB_RELEASE_REPO/releases/latest" >&2
+        return 1
+    fi
+
+    echo "📂 Installing to: $install_path" >&2
+
+    # Replace the script
+    chmod +x "$tmp_script"
+    if cp "$tmp_script" "$install_path" 2>/dev/null; then
+        : # success
+    elif command -v sudo >/dev/null 2>&1; then
+        echo "🔑 Requires elevated permissions, using sudo..." >&2
+        if ! sudo cp "$tmp_script" "$install_path"; then
+            echo "❌ Failed to install update." >&2
+            return 1
+        fi
+    else
+        echo "❌ Cannot write to $install_path and sudo is not available." >&2
+        return 1
+    fi
+
+    # Update the version cache
+    mkdir -p "$LC_UPDATE_CACHE_DIR" 2>/dev/null || true
+    printf '%s\n%s\n' "$(date +%s)" "$latest_tag" > "$LC_UPDATE_CACHE_FILE" 2>/dev/null || true
+
+    echo "✅ Updated to $latest_tag successfully!" >&2
+    return 0
+}
+
 show_help() {
     cat << EOF
 Linear Claude - Run Claude Code iteratively on Linear issues
 
 USAGE:
-    linear-claude <linear-view-url-or-id> [options]
+    linear-claude <command> [options]
+
+COMMANDS:
+    view <url-or-id>    Process issues from a Linear custom view
+    update              Update linear-claude to the latest version
+    version             Show version information
+    help                Show this help message
+
+GLOBAL OPTIONS:
+    -h, --help          Show this help message
+    -v, --version       Show version information
+
+EXAMPLES:
+    linear-claude view "https://linear.app/team/view/abc123"
+    linear-claude view abc123 -m 3 --max-cost 10.00
+    linear-claude update
+    linear-claude version
+
+Run 'linear-claude <command> --help' for more information on a specific command.
+EOF
+}
+
+show_view_help() {
+    cat << EOF
+Linear Claude — View
+
+USAGE:
+    linear-claude view <linear-view-url-or-id> [options]
 
 ARGUMENTS:
     <linear-view-url-or-id>       Linear view URL or ID (required)
 
 OPTIONS:
     -h, --help                    Show this help message
-    -v, --version                 Show version information
     -m, --max-runs <number>       Maximum number of successful iterations (use 0 for unlimited with --max-cost or --max-duration)
     --max-cost <dollars>          Maximum cost in USD to spend
     --max-duration <duration>     Maximum duration to run (e.g., "2h", "30m", "1h30m")
@@ -168,19 +432,19 @@ OPTIONS:
 
 EXAMPLES:
     # Run one iteration per issue from a Linear view
-    linear-claude "https://linear.app/alan/view/abc123"
+    linear-claude view "https://linear.app/alan/view/abc123"
 
     # Limit processing to 3 issues and \$10
-    linear-claude abc123 -m 3 --max-cost 10.00
+    linear-claude view abc123 -m 3 --max-cost 10.00
 
     # Run for a maximum duration
-    linear-claude abc123 --max-duration 2h
+    linear-claude view abc123 --max-duration 2h
 
     # Open PRs for each issue
-    linear-claude abc123 --open-pr
+    linear-claude view abc123 --open-pr
 
     # Run without commits (testing mode)
-    linear-claude abc123 --disable-commits
+    linear-claude view abc123 --disable-commits
 
 REQUIREMENTS:
     - Claude Code CLI (https://claude.ai/code)
@@ -232,11 +496,7 @@ parse_arguments() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -h|--help)
-                show_help
-                exit 0
-                ;;
-            -v|--version)
-                show_version
+                show_view_help
                 exit 0
                 ;;
             -m|--max-runs)
@@ -1747,8 +2007,9 @@ show_completion_summary() {
     fi
 }
 
-main() {
+cmd_view() {
     parse_arguments "$@"
+    check_for_updates
     validate_arguments
     validate_requirements
 
@@ -1763,6 +2024,39 @@ main() {
     show_completion_summary
 }
 
+dispatch() {
+    if [ $# -eq 0 ]; then
+        show_help
+        exit 0
+    fi
+
+    case "$1" in
+        view)
+            shift
+            cmd_view "$@"
+            ;;
+        update)
+            shift
+            cmd_update "$@"
+            ;;
+        version|-v|--version)
+            show_version
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        *)
+            echo "❌ Unknown command: $1" >&2
+            echo "" >&2
+            echo "Usage: linear-claude <command> [options]" >&2
+            echo "" >&2
+            echo "Available commands: view, update, version, help" >&2
+            echo "Run 'linear-claude help' for more information." >&2
+            exit 1
+            ;;
+    esac
+}
+
 if [ -z "$TESTING" ]; then
-    main "$@"
+    dispatch "$@"
 fi
