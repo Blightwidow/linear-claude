@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.1
+
+- fix: release workflow (cce2ffb)
+- fix: trap directory and notes (08e9e94)
+
 ## v0.1.0
 
 Initial release.
