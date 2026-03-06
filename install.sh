@@ -2,41 +2,104 @@
 
 set -e
 
-# Colors for output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="linear-claude"
-REPO_URL="https://raw.githubusercontent.com/Blightwidow/linear-claude/main"
+REPO="Blightwidow/linear-claude"
 
-echo "🔂 Installing Linear Claude..."
+# Detect platform
+detect_target() {
+    local arch os target
 
-# Create install directory if it doesn't exist
-mkdir -p "$INSTALL_DIR"
+    arch=$(uname -m)
+    os=$(uname -s)
 
-# Download the script
-echo "📥 Downloading $BINARY_NAME..."
-if ! curl -fsSL "$REPO_URL/linear_claude.sh" -o "$INSTALL_DIR/$BINARY_NAME"; then
-    echo -e "${RED}❌ Failed to download $BINARY_NAME${NC}" >&2
+    case "$os" in
+        Darwin) os="apple-darwin" ;;
+        Linux)  os="unknown-linux-gnu" ;;
+        *)
+            echo -e "${RED}Unsupported OS: $os${NC}" >&2
+            exit 1
+            ;;
+    esac
+
+    case "$arch" in
+        x86_64|amd64) arch="x86_64" ;;
+        arm64|aarch64) arch="aarch64" ;;
+        *)
+            echo -e "${RED}Unsupported architecture: $arch${NC}" >&2
+            exit 1
+            ;;
+    esac
+
+    echo "${arch}-${os}"
+}
+
+echo "Installing Linear Claude..."
+
+TARGET=$(detect_target)
+echo "Detected platform: $TARGET"
+
+# Fetch latest release info
+echo "Fetching latest release..."
+RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null) || {
+    echo -e "${RED}Failed to fetch release information${NC}" >&2
+    exit 1
+}
+
+DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep -o '"browser_download_url":[^,]*' | grep "$TARGET\"" | head -1 | cut -d'"' -f4)
+CHECKSUM_URL=$(echo "$RELEASE_JSON" | grep -o '"browser_download_url":[^,]*' | grep "${TARGET}.sha256\"" | head -1 | cut -d'"' -f4)
+
+if [ -z "$DOWNLOAD_URL" ]; then
+    echo -e "${RED}No binary found for platform: $TARGET${NC}" >&2
+    echo "Available assets:" >&2
+    echo "$RELEASE_JSON" | grep '"name"' | head -10 >&2
     exit 1
 fi
 
-# Make it executable
+mkdir -p "$INSTALL_DIR"
+
+# Download binary
+echo "Downloading $BINARY_NAME for $TARGET..."
+if ! curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/$BINARY_NAME"; then
+    echo -e "${RED}Failed to download binary${NC}" >&2
+    exit 1
+fi
+
+# Verify checksum if available
+if [ -n "$CHECKSUM_URL" ]; then
+    echo "Verifying checksum..."
+    EXPECTED_SHA=$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null | awk '{print $1}')
+    if command -v shasum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(shasum -a 256 "$INSTALL_DIR/$BINARY_NAME" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(sha256sum "$INSTALL_DIR/$BINARY_NAME" | awk '{print $1}')
+    fi
+
+    if [ -n "$ACTUAL_SHA" ] && [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+        echo -e "${RED}Checksum verification failed!${NC}" >&2
+        echo "  Expected: $EXPECTED_SHA" >&2
+        echo "  Got:      $ACTUAL_SHA" >&2
+        rm -f "$INSTALL_DIR/$BINARY_NAME"
+        exit 1
+    fi
+    echo -e "${GREEN}Checksum verified${NC}"
+fi
+
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
-echo -e "${GREEN}✅ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME${NC}"
+echo -e "${GREEN}$BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME${NC}"
 
 # Check if install directory is in PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo -e "${YELLOW}⚠️  Warning: $INSTALL_DIR is not in your PATH${NC}"
+    echo -e "${YELLOW}Warning: $INSTALL_DIR is not in your PATH${NC}"
     echo ""
-    echo "To add it to your PATH, add this line to your shell profile:"
+    echo "Add it to your PATH by adding this line to your shell profile:"
     echo ""
-    
-    # Detect shell
     if [[ "$SHELL" == *"zsh"* ]]; then
         echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
         echo "  source ~/.zshrc"
@@ -49,52 +112,21 @@ if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo ""
 fi
 
-# Check for dependencies
+# Check for required dependency
 echo ""
-echo "🔍 Checking dependencies..."
+echo "Checking dependencies..."
 
-missing_deps=()
-
-if ! command -v claude &> /dev/null; then
-    missing_deps+=("Claude Code CLI")
-fi
-
-if ! command -v gh &> /dev/null; then
-    missing_deps+=("GitHub CLI")
-fi
-
-if ! command -v jq &> /dev/null; then
-    missing_deps+=("jq")
-fi
-
-if ! command -v linear &> /dev/null; then
-    missing_deps+=("Linear CLI")
-fi
-
-if [ ${#missing_deps[@]} -eq 0 ]; then
-    echo -e "${GREEN}✅ All dependencies installed${NC}"
+if command -v claude &> /dev/null; then
+    echo -e "${GREEN}Claude Code CLI found${NC}"
 else
-    echo -e "${YELLOW}⚠️  Missing dependencies:${NC}"
-    for dep in "${missing_deps[@]}"; do
-        echo "   - $dep"
-    done
-    echo ""
-    echo "Install them with:"
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        echo "  brew install gh jq schpet/tap/linear"
-        echo "  brew install --cask claude-code"
-    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        echo "  # Install GitHub CLI: https://github.com/cli/cli#installation"
-        echo "  sudo apt-get install jq  # or equivalent for your distro"
-        echo "  # Install Linear CLI: https://github.com/schpet/linear"
-        echo "  # Install Claude Code CLI: https://code.claude.com"
-    fi
+    echo -e "${YELLOW}Warning: Claude Code CLI not found${NC}"
+    echo "  Install from: https://claude.ai/code"
 fi
 
 echo ""
-echo -e "${GREEN}🎉 Installation complete!${NC}"
+echo -e "${GREEN}Installation complete!${NC}"
 echo ""
 echo "Get started with:"
 echo "  $BINARY_NAME view \"https://linear.app/team/view/your-view-id\""
 echo ""
-echo "For more information, visit: https://github.com/Blightwidow/linear-claude"
+echo "For more information, visit: https://github.com/$REPO"

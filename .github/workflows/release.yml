@@ -9,7 +9,58 @@ permissions:
   contents: write
 
 jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          BINARY=target/${{ matrix.target }}/release/linear-claude
+          ASSET_NAME=linear-claude-${{ matrix.target }}
+          cp "$BINARY" "$ASSET_NAME"
+          shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256" 2>/dev/null || sha256sum "$ASSET_NAME" > "$ASSET_NAME.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linear-claude-${{ matrix.target }}
+          path: |
+            linear-claude-${{ matrix.target }}
+            linear-claude-${{ matrix.target }}.sha256
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,18 +71,17 @@ jobs:
       - name: Verify version matches tag
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          SCRIPT_VERSION=$(grep -m1 '^LC_VERSION=' linear_claude.sh | cut -d'"' -f2)
-          if [ "$TAG" != "$SCRIPT_VERSION" ]; then
-            echo "::error::Tag ($TAG) does not match LC_VERSION in script ($SCRIPT_VERSION)"
+          CARGO_VERSION="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag ($TAG) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
           echo "VERSION=$TAG" >> "$GITHUB_ENV"
 
-      - name: Compute SHA256
-        run: |
-          sha256sum linear_claude.sh > linear_claude.sh.sha256
-          echo "SHA256 checksum:"
-          cat linear_claude.sh.sha256
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Generate changelog from commits
         run: |
@@ -59,6 +109,15 @@ jobs:
             { echo "# Changelog"; echo ""; cat new_entry.md; } > CHANGELOG.md
           fi
 
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/linear-claude-*/; do
+            cp "$dir"/* release-assets/ 2>/dev/null || true
+          done
+          # Create a combined checksum file
+          cat release-assets/*.sha256 > release-assets/checksums.sha256
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -71,19 +130,27 @@ jobs:
             fi
             echo ""
             cat commit_list.txt
+            echo ""
+            echo "## Binaries"
+            echo ""
+            echo "| Platform | Binary |"
+            echo "|----------|--------|"
+            echo "| macOS (Apple Silicon) | \`linear-claude-aarch64-apple-darwin\` |"
+            echo "| macOS (Intel) | \`linear-claude-x86_64-apple-darwin\` |"
+            echo "| Linux (x86_64) | \`linear-claude-x86_64-unknown-linux-gnu\` |"
+            echo "| Linux (aarch64) | \`linear-claude-aarch64-unknown-linux-gnu\` |"
           } > release_notes.md
 
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes-file release_notes.md \
-            linear_claude.sh \
-            linear_claude.sh.sha256
+            release-assets/*
 
-      - name: Commit changelog and checksum to main
+      - name: Commit changelog to main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout main
-          git add CHANGELOG.md linear_claude.sh.sha256
-          git commit -m "release: update changelog and checksum for $VERSION"
+          git add CHANGELOG.md
+          git commit -m "release: update changelog for $VERSION"
           git push origin main
