@@ -2,13 +2,9 @@
 
 LC_VERSION="v0.1.1"
 
-LC_ADDITIONAL_FLAGS="--output-format stream-json --verbose"
-
 LC_NOTES_DIR="./.claude/plans"
 
 LC_PROMPT_JQ_INSTALL="Please install jq for JSON parsing"
-
-LC_PROMPT_COMMIT_MESSAGE="Please review all uncommitted changes in the git repository (both modified and new files). Write a commit message with: (1) a short one-line summary, (2) two newlines, (3) then a detailed explanation. Do not include any footers or metadata like 'Generated with Claude Code' or 'Co-Authored-By'. Feel free to look at the last few commits to get a sense of the commit message style for consistency. First run 'git add .' to stage all changes including new untracked files, then commit using 'git commit -m \"your message\"' (don't push, just commit, no need to ask for confirmation)."
 
 LC_PROMPT_WORKFLOW_CONTEXT="## CONTINUOUS WORKFLOW CONTEXT
 
@@ -16,7 +12,7 @@ This is part of a continuous development loop where work happens incrementally a
 
 **Important**: You don't need to complete the entire goal in one iteration. Just make meaningful progress on one thing, then leave clear notes for the next iteration (human or AI). Think of it as a relay race where you're passing the baton.
 
-**Do NOT commit or push changes** - The automation will handle committing and pushing your changes after you finish. Just focus on making the code changes.
+**When you're done**: Stage all changes with \`git add .\`, commit with a clear message, and push the branch. Do not create a PR — the automation will handle that if needed.
 
 **Project Completion Signal**: If you determine that not just your current task but the ENTIRE project goal is fully complete (nothing more to be done on the overall goal), only include the exact phrase \"COMPLETION_SIGNAL_PLACEHOLDER\" in your response. Only use this when absolutely certain that the whole project is finished, not just your individual task. We will stop working on this project when multiple developers independently determine that the project is complete.
 
@@ -36,15 +32,8 @@ The file should NOT include:
 - Information that can be discovered by running tests/coverage
 - Unnecessary details"
 
-LC_PROMPT_REVIEWER_CONTEXT="## CODE REVIEW CONTEXT
-
-You are performing a review pass on changes just made by another developer. This is NOT a new feature implementation - you are reviewing and validating existing changes using the instructions given below by the user. Feel free to use git commands to see what changes were made if it's helpful to you.
-
-**Do NOT commit or push changes** - The automation will handle committing and pushing your changes after you finish. Just focus on validating and fixing any issues."
-
 LC_PROMPT=""
 LC_MAX_RUNS=""
-LC_MAX_COST=""
 LC_MAX_DURATION=""
 LC_ENABLE_COMMITS=true
 LC_DISABLE_BRANCHES=false
@@ -54,15 +43,16 @@ LC_GITHUB_REPO=""
 LC_DRY_RUN=false
 LC_COMPLETION_SIGNAL="LINEAR_CLAUDE_PROJECT_COMPLETE"
 LC_COMPLETION_THRESHOLD=3
-LC_ERROR_LOG=""
 error_count=0
 extra_iterations=0
 successful_iterations=0
-total_cost=0
 completion_signal_count=0
 i=1
 LC_EXTRA_CLAUDE_FLAGS=()
 LC_REVIEW_PROMPT=""
+LC_ALLOWED_TOOLS="Bash,Read,Edit,Write,Grep,Glob,WebFetch,WebSearch"
+LC_UNPUSHED_BRANCHES=()
+LC_SUMMARY_RESULTS=()
 start_time=""
 LC_LINEAR_VIEW=""
 LC_LINEAR_ISSUES_JSON=""
@@ -392,7 +382,7 @@ GLOBAL OPTIONS:
 
 EXAMPLES:
     linear-claude view "https://linear.app/team/view/abc123"
-    linear-claude view abc123 -m 3 --max-cost 10.00
+    linear-claude view abc123 -m 3 --max-duration 2h
     linear-claude update
     linear-claude version
 
@@ -412,8 +402,7 @@ ARGUMENTS:
 
 OPTIONS:
     -h, --help                    Show this help message
-    -m, --max-runs <number>       Maximum number of successful iterations (use 0 for unlimited with --max-cost or --max-duration)
-    --max-cost <dollars>          Maximum cost in USD to spend
+    -m, --max-runs <number>       Maximum number of successful iterations (use 0 for unlimited with --max-duration)
     --max-duration <duration>     Maximum duration to run (e.g., "2h", "30m", "1h30m")
     --owner <owner>               GitHub repository owner (auto-detected from git remote if not provided)
     --repo <repo>                 GitHub repository name (auto-detected from git remote if not provided)
@@ -424,15 +413,16 @@ OPTIONS:
     --dry-run                     Simulate execution without making changes
     --completion-signal <phrase>  Phrase that agents output when project is complete (default: "LINEAR_CLAUDE_PROJECT_COMPLETE")
     --completion-threshold <num>  Number of consecutive signals to stop early (default: 3)
-    -r, --review-prompt <text>    Run a reviewer pass after each iteration to validate changes
+    -r, --review-prompt <text>    Additional review instructions appended to the main prompt
+    --allowed-tools <tools>       Comma-separated tools for Claude (default: "Bash,Read,Edit,Write,Grep,Glob,WebFetch,WebSearch")
     --open-pr                     Create a PR after pushing (default: no PR created)
 
 EXAMPLES:
     # Run one iteration per issue from a Linear view
     linear-claude view "https://linear.app/alan/view/abc123"
 
-    # Limit processing to 3 issues and \$10
-    linear-claude view abc123 -m 3 --max-cost 10.00
+    # Limit processing to 3 issues
+    linear-claude view abc123 -m 3
 
     # Run for a maximum duration
     linear-claude view abc123 --max-duration 2h
@@ -500,10 +490,6 @@ parse_arguments() {
                 LC_MAX_RUNS="$2"
                 shift 2
                 ;;
-            --max-cost)
-                LC_MAX_COST="$2"
-                shift 2
-                ;;
             --max-duration)
                 LC_MAX_DURATION="$2"
                 shift 2
@@ -552,6 +538,10 @@ parse_arguments() {
                 LC_OPEN_PR=true
                 shift
                 ;;
+            --allowed-tools)
+                LC_ALLOWED_TOOLS="$2"
+                shift 2
+                ;;
             -*)
                 LC_EXTRA_CLAUDE_FLAGS+=("$1")
                 shift
@@ -579,13 +569,6 @@ validate_arguments() {
     if [ -n "$LC_MAX_RUNS" ] && ! [[ "$LC_MAX_RUNS" =~ ^[0-9]+$ ]]; then
         echo "❌ Error: --max-runs must be a non-negative integer" >&2
         exit 1
-    fi
-
-    if [ -n "$LC_MAX_COST" ]; then
-        if ! [[ "$LC_MAX_COST" =~ ^[0-9]+\.?[0-9]*$ ]] || [ "$(awk "BEGIN {print ($LC_MAX_COST <= 0)}")" = "1" ]; then
-            echo "❌ Error: --max-cost must be a positive number" >&2
-            exit 1
-        fi
     fi
 
     if [ -n "$LC_MAX_DURATION" ]; then
@@ -642,12 +625,9 @@ validate_requirements() {
     fi
 
     if ! command -v jq &> /dev/null; then
-        echo "⚠️ jq is required for JSON parsing but is not installed. Asking Claude Code to install it..." >&2
-        claude -p "$LC_PROMPT_JQ_INSTALL" --allowedTools "Bash,Read"
-        if ! command -v jq &> /dev/null; then
-            echo "❌ Error: jq is still not installed after Claude Code attempt." >&2
-            exit 1
-        fi
+        echo "❌ Error: jq is required for JSON parsing but is not installed." >&2
+        echo "   Install with: brew install jq (macOS) or apt-get install jq (Linux)" >&2
+        exit 1
     fi
 
     if ! command -v linear &> /dev/null; then
@@ -742,230 +722,33 @@ create_iteration_branch() {
     return 0
 }
 
-linear_claude_commit() {
-    local iteration_display="$1"
-    local branch_name="$2"
-    local main_branch="$3"
-    local notes_file="$4"
+print_issue_header() {
+    local identifier="$1"
+    local title="$2"
+    local state="$3"
+    local issue_num="$4"
+    local issue_total="$5"
 
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        return 0
+    export LC_ISSUE_HEADER_LINE="$identifier — $title ($state, $issue_num/$issue_total)"
+
+    # Set terminal title
+    printf '\033]0;%s\007' "$LC_ISSUE_HEADER_LINE" >&2
+
+    # iTerm2 badge (persists through alt screen buffer)
+    if [ "$TERM_PROGRAM" = "iTerm.app" ]; then
+        printf '\033]1337;SetBadge=%s\007' "$(echo -n "$LC_ISSUE_HEADER_LINE" | base64)" >&2
     fi
 
-    local has_changes=false
-    if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty; then
-        has_changes=true
-    fi
-
-    if [ -z "$(git ls-files --others --exclude-standard)" ]; then
-        : # no untracked files
-    else
-        has_changes=true
-    fi
-
-    if [ "$has_changes" = "false" ]; then
-        echo "🫙 $iteration_display No changes detected, cleaning up branch..." >&2
-        git checkout "$main_branch" >/dev/null 2>&1
-        git branch -D "$branch_name" >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    if [ "$LC_DRY_RUN" = "true" ]; then
-        echo "💬 $iteration_display (DRY RUN) Would commit changes..." >&2
-        echo "📦 $iteration_display (DRY RUN) Changes committed on branch: $branch_name" >&2
-        echo "📤 $iteration_display (DRY RUN) Would push branch..." >&2
-        if [ "$LC_OPEN_PR" = "true" ]; then
-            echo "🔨 $iteration_display (DRY RUN) Would create pull request..." >&2
-        fi
-        return 0
-    fi
-
-    local commit_attempts=0
-    local max_commit_attempts=3
-
-    while [ $commit_attempts -lt $max_commit_attempts ]; do
-        commit_attempts=$((commit_attempts + 1))
-
-        if [ $commit_attempts -eq 1 ]; then
-            echo "💬 $iteration_display Committing changes..." >&2
-        else
-            echo "🔄 $iteration_display Commit retry $commit_attempts/$max_commit_attempts..." >&2
-        fi
-
-        local commit_prompt="$LC_PROMPT_COMMIT_MESSAGE"
-        if [ $commit_attempts -eq $max_commit_attempts ]; then
-            echo "⚠️  $iteration_display Last attempt — using --no-verify to skip pre-commit hooks" >&2
-            commit_prompt="$LC_PROMPT_COMMIT_MESSAGE Use the --no-verify flag when committing (e.g., git commit --no-verify -m \"...\") to skip pre-commit hooks."
-        fi
-
-        local commit_output
-        commit_output=$(claude -p "$commit_prompt" --allowedTools "Bash(git)" 2>&1)
-        local commit_exit=$?
-
-        if [ $commit_exit -ne 0 ]; then
-            echo "⚠️  $iteration_display Commit command failed (attempt $commit_attempts/$max_commit_attempts)" >&2
-            if [ $commit_attempts -ge $max_commit_attempts ]; then
-                echo "❌ $iteration_display Failed to commit after $max_commit_attempts attempts" >&2
-                git checkout "$main_branch" >/dev/null 2>&1
-                return 1
-            fi
-            local fix_prompt="The previous commit attempt failed with the following output:\n\n$commit_output\n\nPlease fix the issues (e.g., linting errors, pre-commit hook failures) and then stage and commit all changes using 'git add . && git commit -m \"your message\"'. Do not push."
-            echo "🔧 $iteration_display Asking Claude to fix commit issues..." >&2
-            claude -p "$fix_prompt" --allowedTools "Bash,Read,Edit,Write,Grep,Glob" >/dev/null 2>&1 || true
-            continue
-        fi
-
-        # Check if changes are still present after commit
-        if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty || [ -n "$(git ls-files --others --exclude-standard)" ]; then
-            echo "⚠️  $iteration_display Changes still present after commit (attempt $commit_attempts/$max_commit_attempts)" >&2
-            if [ $commit_attempts -ge $max_commit_attempts ]; then
-                echo "❌ $iteration_display Uncommitted changes remain after $max_commit_attempts attempts" >&2
-                git checkout "$main_branch" >/dev/null 2>&1
-                return 1
-            fi
-            local remaining_files
-            remaining_files=$(git diff --name-only --ignore-submodules=dirty 2>/dev/null; git diff --cached --name-only --ignore-submodules=dirty 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-            local fix_prompt="The previous commit did not include all changes. These files still have uncommitted changes:\n\n$remaining_files\n\nPlease stage ALL changes (including untracked files) and commit them. Use 'git add . && git commit -m \"your message\"' or amend the previous commit with 'git add . && git commit --amend --no-edit'. Do not push."
-            echo "🔧 $iteration_display Asking Claude to commit remaining files..." >&2
-            claude -p "$fix_prompt" --allowedTools "Bash(git)" >/dev/null 2>&1 || true
-            continue
-        fi
-
-        break
-    done
-
-    echo "📦 $iteration_display Changes committed on branch: $branch_name" >&2
-
-    local commit_message=$(git log -1 --format="%B" "$branch_name")
-    local commit_title=$(echo "$commit_message" | head -n 1)
-    local commit_body=$(echo "$commit_message" | tail -n +4)
-
-    echo "📤 $iteration_display Pushing branch..." >&2
-    if ! git push -u origin "$branch_name" >/dev/null 2>&1; then
-        echo "⚠️  $iteration_display Failed to push branch" >&2
-        git checkout "$main_branch" >/dev/null 2>&1
-        return 1
-    fi
-
-    echo "✅ $iteration_display Pushed branch: $branch_name" >&2
-
-    if [ "$LC_OPEN_PR" = "true" ]; then
-        echo "🔨 $iteration_display Creating pull request..." >&2
-        local pr_output
-        if ! pr_output=$(gh pr create --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch" --draft 2>&1); then
-            echo "⚠️  $iteration_display Failed to create PR: $pr_output" >&2
-            # Not fatal — branch was pushed successfully
-        else
-            local pr_number=$(echo "$pr_output" | grep -oE '(pull/|#)[0-9]+' | grep -oE '[0-9]+' | head -n 1)
-            echo "✅ $iteration_display PR #$pr_number created: $commit_title" >&2
-
-            # Post notes as a PR comment
-            if [ -n "$pr_number" ] && [ -n "$notes_file" ] && [ -f "$notes_file" ]; then
-                local notes_content
-                notes_content=$(cat "$notes_file")
-                if [ -n "$notes_content" ]; then
-                    local comment_body="## Claude's Notes
-
-$notes_content"
-                    if gh pr comment "$pr_number" --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --body "$comment_body" >/dev/null 2>&1; then
-                        echo "💬 $iteration_display Posted notes as PR comment" >&2
-                    else
-                        echo "⚠️  $iteration_display Failed to post notes as PR comment" >&2
-                    fi
-                fi
-            fi
-        fi
-    fi
-
-    # Return to main branch
-    if ! git checkout "$main_branch" >/dev/null 2>&1; then
-        echo "⚠️  $iteration_display Failed to checkout $main_branch" >&2
-        return 1
-    fi
-
-    return 0
+    # Print a one-liner for scrollback context
+    echo "--- $LC_ISSUE_HEADER_LINE ---" >&2
 }
 
-commit_on_current_branch() {
-    local iteration_display="$1"
-
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        return 0
+reset_terminal_title() {
+    printf '\033]0;%s\007' "${TERM_PROGRAM:-Terminal}" >&2
+    # Clear iTerm2 badge
+    if [ "$TERM_PROGRAM" = "iTerm.app" ]; then
+        printf '\033]1337;SetBadge=\007' >&2
     fi
-
-    local has_changes=false
-    if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty; then
-        has_changes=true
-    fi
-
-    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
-        has_changes=true
-    fi
-
-    if [ "$has_changes" = "false" ]; then
-        echo "ℹ️  $iteration_display No changes to commit" >&2
-        return 0
-    fi
-
-    if [ "$LC_DRY_RUN" = "true" ]; then
-        echo "💬 $iteration_display (DRY RUN) Would commit changes on current branch..." >&2
-        return 0
-    fi
-
-    local commit_attempts=0
-    local max_commit_attempts=3
-
-    while [ $commit_attempts -lt $max_commit_attempts ]; do
-        commit_attempts=$((commit_attempts + 1))
-
-        if [ $commit_attempts -eq 1 ]; then
-            echo "💬 $iteration_display Committing changes on current branch..." >&2
-        else
-            echo "🔄 $iteration_display Commit retry $commit_attempts/$max_commit_attempts..." >&2
-        fi
-
-        local commit_prompt="$LC_PROMPT_COMMIT_MESSAGE"
-        if [ $commit_attempts -eq $max_commit_attempts ]; then
-            echo "⚠️  $iteration_display Last attempt — using --no-verify to skip pre-commit hooks" >&2
-            commit_prompt="$LC_PROMPT_COMMIT_MESSAGE Use the --no-verify flag when committing (e.g., git commit --no-verify -m \"...\") to skip pre-commit hooks."
-        fi
-
-        local commit_output
-        commit_output=$(claude -p "$commit_prompt" --allowedTools "Bash(git)" 2>&1)
-        local commit_exit=$?
-
-        if [ $commit_exit -ne 0 ]; then
-            echo "⚠️  $iteration_display Commit failed (attempt $commit_attempts/$max_commit_attempts)" >&2
-            if [ $commit_attempts -ge $max_commit_attempts ]; then
-                echo "❌ $iteration_display Failed to commit after $max_commit_attempts attempts" >&2
-                return 1
-            fi
-            local fix_prompt="The previous commit attempt failed with the following output:\n\n$commit_output\n\nPlease fix the issues (e.g., linting errors, pre-commit hook failures) and then stage and commit all changes using 'git add . && git commit -m \"your message\"'. Do not push."
-            echo "🔧 $iteration_display Asking Claude to fix commit issues..." >&2
-            claude -p "$fix_prompt" --allowedTools "Bash,Read,Edit,Write,Grep,Glob" >/dev/null 2>&1 || true
-            continue
-        fi
-
-        if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty || [ -n "$(git ls-files --others --exclude-standard)" ]; then
-            echo "⚠️  $iteration_display Changes still present after commit (attempt $commit_attempts/$max_commit_attempts)" >&2
-            if [ $commit_attempts -ge $max_commit_attempts ]; then
-                echo "❌ $iteration_display Uncommitted changes remain after $max_commit_attempts attempts" >&2
-                return 1
-            fi
-            local remaining_files
-            remaining_files=$(git diff --name-only --ignore-submodules=dirty 2>/dev/null; git diff --cached --name-only --ignore-submodules=dirty 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-            local fix_prompt="The previous commit did not include all changes. These files still have uncommitted changes:\n\n$remaining_files\n\nPlease stage ALL changes and commit them. Use 'git add . && git commit -m \"your message\"' or amend with 'git add . && git commit --amend --no-edit'. Do not push."
-            echo "🔧 $iteration_display Asking Claude to commit remaining files..." >&2
-            claude -p "$fix_prompt" --allowedTools "Bash(git)" >/dev/null 2>&1 || true
-            continue
-        fi
-
-        break
-    done
-
-    local commit_title=$(git log -1 --format="%s")
-    echo "✅ $iteration_display Committed: $commit_title" >&2
-    return 0
 }
 
 get_iteration_display() {
@@ -981,426 +764,341 @@ get_iteration_display() {
     fi
 }
 
-run_claude_iteration() {
+run_claude_interactive() {
     local prompt="$1"
-    local flags="$2"
-    local error_log="$3"
-    local iteration_display="$4"
+    local allowed_tools="${2:-$LC_ALLOWED_TOOLS}"
 
     if [ "$LC_DRY_RUN" = "true" ]; then
-        echo "🤖 (DRY RUN) Would run Claude Code with prompt: $prompt" >&2
-        echo "📝 (DRY RUN) Output: This is a simulated response from Claude Code." > "$error_log"
+        echo "(DRY RUN) Would run Claude interactively" >&2
         return 0
     fi
 
-    local temp_stdout=$(mktemp)
-    local temp_stderr=$(mktemp)
-    local exit_code=0
+    # If header is set and Python 3 is available, use PTY wrapper for persistent header
+    if [ -n "$LC_ISSUE_HEADER_LINE" ] && command -v python3 &>/dev/null; then
+        _run_claude_with_pty_header "$prompt" "$allowed_tools"
+        return $?
+    fi
 
-    set -o pipefail
-    { echo $BASHPID > "$LC_CLAUDE_PID_FILE"; exec claude -p "$prompt" $flags "${LC_EXTRA_CLAUDE_FLAGS[@]}"; } 2> >(tee "$temp_stderr" >&2) | \
-        tee "$temp_stdout" | \
-        while IFS= read -r line; do
-            text=$(echo "$line" | jq -r '
-                if .type == "assistant" then
-                    .message.content[]? | select(.type == "text") | .text // empty
-                elif .type == "result" then
-                    empty
-                else
-                    empty
-                end
-            ' 2>/dev/null)
-            if [ -n "$text" ]; then
-                echo "$text" | while IFS= read -r output_line; do
-                    printf "   %s 💬 %s\n" "$iteration_display" "$output_line" >&2
-                done
-            fi
+    claude "$prompt" --allowedTools "$allowed_tools" "${LC_EXTRA_CLAUDE_FLAGS[@]}"
+    return $?
+}
 
-            tool_info=$(echo "$line" | jq -r --arg pwd "$PWD" '
-                def relpath: (if startswith($pwd + "/") then .[$pwd | length + 1:] elif . == $pwd then "." else . end) // .;
-                def get_detail:
-                    if .name == "Bash" then
-                        ((.input.command // "" | gsub($pwd + "/"; "") | split("\n")[0] | if length > 1000 then .[0:1000] + "..." else . end) // "")
-                    elif .name == "Read" then
-                        (((.input.file_path // "") | relpath) + (if .input.offset then " (line " + (.input.offset | tostring) + ")" else "" end)) // ""
-                    elif .name == "Write" or .name == "Edit" or .name == "MultiEdit" then
-                        ((.input.file_path // "") | relpath) // ""
-                    elif .name == "Glob" then
-                        ((.input.pattern // "") + (if .input.path then " in " + (.input.path | relpath) else "" end)) // ""
-                    elif .name == "Grep" then
-                        (("\"" + (.input.pattern // "") + "\"" + (if .input.path then " in " + (.input.path | relpath) else "" end) + (if .input.glob then " (" + .input.glob + ")" else "" end))) // ""
-                    elif .name == "WebFetch" or (.name | startswith("WebFetch")) then
-                        (((.input.url // "") + " → " + ((.input.prompt // "") | if length > 1000 then .[0:1000] + "..." else . end))) // ""
-                    elif .name == "WebSearch" or (.name | startswith("WebSearch")) then
-                        (("\"" + (.input.query // "") + "\"" + (if .input.allowed_domains then " (domains: " + (.input.allowed_domains | join(", ")) + ")" else "" end))) // ""
-                    elif .name == "Task" then
-                        (("[" + (.input.subagent_type // "agent") + "] " + (.input.description // ""))) // ""
-                    elif .name == "NotebookEdit" then
-                        ((((.input.notebook_path // "") | relpath) + " [" + (.input.edit_mode // "replace") + "]")) // ""
-                    elif .name == "AskUserQuestion" then
-                        ((.input.questions[0].question // "" | if length > 1000 then .[0:1000] + "..." else . end)) // ""
-                    elif .name == "Skill" or .name == "SlashCommand" then
-                        (("/" + (.input.skill // .input.command // "") + (if .input.args then " " + .input.args else "" end))) // ""
-                    elif (.name | test("TodoWrite"; "i")) then
-                        ((if .input.todos then
-                            (.input.todos | map(select(.status == "in_progress") | .content // .activeForm) | first //
-                             (.input.todos | first | .content // .activeForm // "")) |
-                            if length > 1000 then .[0:1000] + "..." else . end
-                        else "" end)) // ""
-                    elif (.name | test("TaskCreate"; "i")) then
-                        (.input.subject // .input.description // "")
-                    elif (.name | test("TaskUpdate"; "i")) then
-                        (("#" + (.input.taskId // "") + " → " + (.input.status // "update"))) // ""
-                    elif (.name | test("TaskList|TaskGet"; "i")) then
-                        ((if .input.taskId then "#" + .input.taskId else "" end)) // ""
-                    elif .name == "TaskOutput" or .name == "BashOutput" then
-                        (("id:" + (.input.task_id // .input.bash_id // ""))) // ""
-                    elif .name == "KillShell" then
-                        (("id:" + (.input.shell_id // ""))) // ""
-                    elif .name == "ExitPlanMode" or .name == "EnterPlanMode" then
-                        ""
-                    elif (.name | startswith("mcp__")) then
-                        ((.name | split("__") | .[1:] | join("/"))) // .name
-                    else
-                        .name
-                    end;
-                def get_emoji:
-                    if .name == "Read" then "📖"
-                    elif .name == "Write" then "✍️"
-                    elif .name == "Edit" or .name == "MultiEdit" then "✏️"
-                    elif .name == "Bash" then "💻"
-                    elif .name == "Glob" then "📁"
-                    elif .name == "Grep" then "🔎"
-                    elif .name == "Task" then "📋"
-                    elif .name == "WebFetch" or ((.name | startswith("WebFetch")) // false) then "🌍"
-                    elif .name == "WebSearch" or ((.name | startswith("WebSearch")) // false) then "🔍"
-                    elif .name == "NotebookEdit" then "📓"
-                    elif .name == "AskUserQuestion" then "❓"
-                    elif .name == "Skill" or .name == "SlashCommand" then "⚡"
-                    elif ((.name | test("Todo|TaskCreate|TaskUpdate|TaskList|TaskGet"; "i")) // false) then "📝"
-                    elif .name == "TaskOutput" or .name == "BashOutput" then "📤"
-                    elif .name == "KillShell" then "🛑"
-                    elif .name == "ExitPlanMode" or .name == "EnterPlanMode" then "🗺️"
-                    elif ((.name | startswith("mcp__")) // false) then "🔌"
-                    else "🛠️"
-                    end;
-                if .type == "assistant" then
-                    .message.content[]? |
-                    select(.type == "tool_use") |
-                    ((get_emoji) + " " + ((get_detail) // .name // "unknown"))
-                else
-                    empty
-                end
-            ' 2>/dev/null)
+_run_claude_with_pty_header() {
+    local prompt="$1"
+    local allowed_tools="$2"
 
-            if [ -z "$tool_info" ]; then
-                tool_info=$(echo "$line" | jq -r '
-                    if .type == "assistant" then
-                        .message.content[]? | select(.type == "tool_use") | "🛠️ " + .name
-                    else empty end
-                ' 2>/dev/null)
-            fi
-
-            if [ -n "$tool_info" ]; then
-                echo "$tool_info" | while IFS= read -r tool_line; do
-                    printf "   %s %s\n" "$iteration_display" "$tool_line" >&2
-                done
-            fi
+    # Build the claude command as a shell script to avoid quoting issues
+    local cmd_file
+    cmd_file=$(mktemp "${TMPDIR:-/tmp}/lc-cmd.XXXXXX.sh")
+    {
+        echo '#!/bin/bash'
+        printf 'exec claude %q --allowedTools %q' "$prompt" "$allowed_tools"
+        for flag in "${LC_EXTRA_CLAUDE_FLAGS[@]}"; do
+            printf ' %q' "$flag"
         done
-    exit_code=${PIPESTATUS[0]}
-    set +o pipefail
-    : > "$LC_CLAUDE_PID_FILE"
+        echo ''
+    } > "$cmd_file"
+    chmod +x "$cmd_file"
 
-    wait
+    local wrapper_file
+    wrapper_file=$(mktemp "${TMPDIR:-/tmp}/lc-pty-wrapper.XXXXXX.py")
+    cat > "$wrapper_file" << 'PYTHON_PTY_WRAPPER'
+#!/usr/bin/env python3
+"""PTY wrapper that reserves the top terminal line for a persistent header."""
+import pty, os, sys, select, signal, struct, fcntl, termios, tty, errno
 
-    if [ -f "$temp_stdout" ] && [ -s "$temp_stdout" ]; then
-        cat "$temp_stdout"
-    fi
+header_text = sys.argv[1]
+child_argv = sys.argv[2:]
 
-    if [ -f "$temp_stderr" ] && [ -s "$temp_stderr" ]; then
-        cat "$temp_stderr" > "$error_log"
-    fi
+def get_terminal_size():
+    buf = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b'\x00' * 8)
+    rows, cols = struct.unpack('HHHH', buf)[:2]
+    return rows, cols
 
-    if [ $exit_code -ne 0 ]; then
-        if [ ! -s "$error_log" ] && [ -f "$temp_stdout" ] && [ -s "$temp_stdout" ]; then
-            local json_error=$(cat "$temp_stdout" | jq -s -r '.[-1] | if .is_error == true then .result // .error // "Unknown error" else empty end' 2>/dev/null || echo "")
-            if [ -n "$json_error" ]; then
-                echo "$json_error" > "$error_log"
-                echo "$json_error" >&2
-            fi
-        fi
+def set_child_size(fd, rows, cols):
+    child_rows = max(rows - 1, 1)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', child_rows, cols, 0, 0))
 
-        if [ ! -s "$error_log" ]; then
-            {
-                echo "Claude Code exited with code $exit_code but produced no error output"
-                echo ""
-                echo "This usually means:"
-                echo "  - Claude Code crashed or failed to start"
-                echo "  - An authentication or permission issue occurred"
-                echo "  - The command arguments are invalid"
-                echo ""
-                echo "Try running this command directly to see the full error:"
-                echo "  claude -p \"$prompt\" $flags ${LC_EXTRA_CLAUDE_FLAGS[*]}"
-            } >> "$error_log"
-        fi
+def paint_header():
+    rows, cols = get_terminal_size()
+    text = header_text[:cols].ljust(cols)
+    seq = (
+        b'\x1b7'                                           # save cursor
+        b'\x1b[1;1H'                                       # move to row 1, col 1
+        b'\x1b[7m' + text.encode('utf-8', 'replace') + b'\x1b[0m'  # reverse video header
+        b'\x1b[2;' + str(rows).encode() + b'r'            # scroll region rows 2..N
+        b'\x1b8'                                           # restore cursor
+    )
+    os.write(sys.stdout.fileno(), seq)
 
-        rm -f "$temp_stdout" "$temp_stderr"
-        return $exit_code
-    fi
+def main():
+    rows, cols = get_terminal_size()
 
-    rm -f "$temp_stdout" "$temp_stderr"
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # Child: exec the command
+        os.execvp(child_argv[0], child_argv)
+        sys.exit(127)
 
-    return 0
+    # Parent: set child PTY size (1 row shorter)
+    set_child_size(master_fd, rows, cols)
+
+    # Save original terminal settings and switch to raw mode
+    stdin_fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(stdin_fd)
+    tty.setraw(stdin_fd)
+
+    # Paint initial header and set scroll region
+    paint_header()
+
+    # Handle SIGWINCH (terminal resize)
+    def on_resize(signum, frame):
+        r, c = get_terminal_size()
+        set_child_size(master_fd, r, c)
+        paint_header()
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except OSError:
+            pass
+    signal.signal(signal.SIGWINCH, on_resize)
+
+    # Alt-screen sequences to intercept
+    ALT_SCREEN_SEQS = [b'\x1b[?1049h', b'\x1b[?1049l', b'\x1b[?47h', b'\x1b[?47l']
+    MAX_SEQ_LEN = max(len(s) for s in ALT_SCREEN_SEQS)
+
+    stdout_fd = sys.stdout.fileno()
+    buf = b''
+
+    try:
+        while True:
+            try:
+                fds, _, _ = select.select([stdin_fd, master_fd], [], [], 1.0)
+            except (InterruptedError, OSError):
+                continue
+
+            if stdin_fd in fds:
+                try:
+                    data = os.read(stdin_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(master_fd, data)
+
+            if master_fd in fds:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+
+                # Scan for alt-screen sequences and strip them
+                buf += data
+                out = b''
+                i = 0
+                while i < len(buf):
+                    if buf[i:i+1] == b'\x1b':
+                        remaining = buf[i:]
+                        matched = False
+                        partial = False
+                        for seq in ALT_SCREEN_SEQS:
+                            if remaining.startswith(seq):
+                                # Strip the sequence, repaint header instead
+                                paint_header()
+                                i += len(seq)
+                                matched = True
+                                break
+                            if seq.startswith(remaining) and len(remaining) < len(seq):
+                                partial = True
+                        if matched:
+                            continue
+                        if partial:
+                            # Need more data to determine if this is an alt-screen seq
+                            buf = buf[i:]
+                            if out:
+                                os.write(stdout_fd, out)
+                            break
+                        # Not an alt-screen sequence — check if we might need more bytes
+                        if len(remaining) < MAX_SEQ_LEN:
+                            buf = buf[i:]
+                            if out:
+                                os.write(stdout_fd, out)
+                            break
+                    out += buf[i:i+1]
+                    i += 1
+                else:
+                    buf = b''
+
+                if out:
+                    os.write(stdout_fd, out)
+
+            # Check if child is still alive
+            try:
+                result = os.waitpid(pid, os.WNOHANG)
+                if result[0] != 0:
+                    # Child exited — drain remaining output
+                    while True:
+                        try:
+                            r, _, _ = select.select([master_fd], [], [], 0.1)
+                            if not r:
+                                break
+                            data = os.read(master_fd, 4096)
+                            if not data:
+                                break
+                            os.write(stdout_fd, data)
+                        except OSError:
+                            break
+                    pid = 0
+                    status = result[1]
+                    break
+            except ChildProcessError:
+                break
+    finally:
+        # Restore terminal
+        termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attrs)
+        os.write(stdout_fd, b'\x1b[r')    # reset scroll region
+        os.write(stdout_fd, b'\x1b[H')    # move cursor home
+
+    # Wait for child if we haven't already
+    if pid != 0:
+        try:
+            _, status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            status = 0
+
+    if os.WIFEXITED(status):
+        sys.exit(os.WEXITSTATUS(status))
+    else:
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+PYTHON_PTY_WRAPPER
+
+    python3 "$wrapper_file" "$LC_ISSUE_HEADER_LINE" bash "$cmd_file"
+    local exit_code=$?
+
+    rm -f "$cmd_file" "$wrapper_file"
+    return "$exit_code"
 }
 
-run_reviewer_iteration() {
+verify_commit_and_push() {
     local iteration_display="$1"
-    local review_prompt="$2"
-    local error_log="$3"
+    local branch_name="$2"
+    local main_branch="$3"
+    local notes_file="$4"
 
-    echo "🔍 $iteration_display Running reviewer pass..." >&2
-
-    local full_reviewer_prompt="${LC_PROMPT_REVIEWER_CONTEXT}
-
-## USER REVIEW INSTRUCTIONS
-
-${review_prompt}"
-
-    local result
-    local claude_exit_code=0
-    result=$(run_claude_iteration "$full_reviewer_prompt" "$LC_ADDITIONAL_FLAGS" "$error_log" "$iteration_display") || claude_exit_code=$?
-
-    if [ $claude_exit_code -ne 0 ]; then
-        echo "❌ $iteration_display Reviewer pass failed with exit code: $claude_exit_code" >&2
-        return 1
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        return 0
     fi
 
-    local parse_result=$(parse_claude_result "$result")
-    if [ "$?" != "0" ]; then
-        echo "❌ $iteration_display Reviewer pass returned error: $parse_result" >&2
-        return 1
+    # Check for uncommitted changes
+    local has_uncommitted=false
+    if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty; then
+        has_uncommitted=true
+    fi
+    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        has_uncommitted=true
     fi
 
-    local reviewer_cost=$(echo "$result" | jq -s -r '.[-1].total_cost_usd // empty')
-    if [ -n "$reviewer_cost" ]; then
-        printf "💰 $iteration_display Reviewer cost: \$%.3f\n" "$reviewer_cost" >&2
-        total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $reviewer_cost}")
-        printf "   Running total: \$%.3f\n" "$total_cost" >&2
+    if [ "$has_uncommitted" = "true" ]; then
+        echo "⚠️  $iteration_display Uncommitted changes detected after Claude session" >&2
+        git status --short >&2
     fi
 
-    echo "✅ $iteration_display Reviewer pass completed" >&2
-    return 0
-}
-
-parse_claude_result() {
-    local result="$1"
-
-    if ! echo "$result" | jq -s -e '.[-1]' >/dev/null 2>&1; then
-        echo "invalid_json"
-        return 1
-    fi
-
-    local is_error=$(echo "$result" | jq -s -r '.[-1].is_error // false')
-    if [ "$is_error" = "true" ]; then
-        echo "claude_error"
-        return 1
-    fi
-
-    echo "success"
-    return 0
-}
-
-handle_iteration_error() {
-    local iteration_display="$1"
-    local error_type="$2"
-    local error_output="$3"
-
-    error_count=$((error_count + 1))
-    extra_iterations=$((extra_iterations + 1))
-
-    case "$error_type" in
-        "exit_code")
-            echo "" >&2
-            echo "❌ $iteration_display Error occurred ($error_count consecutive errors):" >&2
-            echo "" >&2
-            if [ -f "$LC_ERROR_LOG" ] && [ -s "$LC_ERROR_LOG" ]; then
-                echo "Error details:" >&2
-                cat "$LC_ERROR_LOG" >&2
-            else
-                echo "No error details captured in log file" >&2
-                echo "Error log path: $LC_ERROR_LOG" >&2
-            fi
-            echo "" >&2
-            ;;
-        "invalid_json")
-            echo "" >&2
-            echo "❌ $iteration_display Error: Invalid JSON response ($error_count consecutive errors):" >&2
-            echo "" >&2
-            echo "$error_output" >&2
-            echo "" >&2
-            ;;
-        "claude_error")
-            echo "" >&2
-            echo "❌ $iteration_display Error in Claude Code response ($error_count consecutive errors):" >&2
-            echo "" >&2
-            echo "$error_output" | jq -s -r '.[-1].result // .[-1] // empty' >&2
-            echo "" >&2
-            ;;
-    esac
-
-    if [ $error_count -ge 3 ]; then
-        echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
-        exit 1
-    fi
-
-    return 1
-}
-
-handle_iteration_success() {
-    local iteration_display="$1"
-    local result="$2"
-    local branch_name="$3"
-    local main_branch="$4"
-    local notes_file="$5"
-
-    local result_text=$(echo "$result" | jq -s -r '.[-1].result // empty')
-
-    if [ -n "$result_text" ] && [[ "$result_text" == *"$LC_COMPLETION_SIGNAL"* ]]; then
-        completion_signal_count=$((completion_signal_count + 1))
-        echo "" >&2
-        echo "🎯 $iteration_display Completion signal detected ($completion_signal_count/$LC_COMPLETION_THRESHOLD)" >&2
-    else
-        if [ $completion_signal_count -gt 0 ]; then
-            echo "" >&2
-            echo "🔄 $iteration_display Completion signal not found, resetting counter" >&2
+    # Check if there are commits on this branch beyond main
+    local has_commits=false
+    if [ -n "$branch_name" ]; then
+        local commit_count
+        commit_count=$(git rev-list --count "$main_branch..$branch_name" 2>/dev/null || echo "0")
+        if [ "$commit_count" -gt 0 ]; then
+            has_commits=true
         fi
-        completion_signal_count=0
     fi
 
-    local cost=$(echo "$result" | jq -s -r '.[-1].total_cost_usd // empty')
-    if [ -n "$cost" ]; then
-        echo "" >&2
-        printf "💰 $iteration_display Iteration cost: \$%.3f\n" "$cost" >&2
-        total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $cost}")
-        printf "   Running total: \$%.3f\n" "$total_cost" >&2
-    fi
-
-    echo "✅ $iteration_display Work completed" >&2
-    if [ "$LC_ENABLE_COMMITS" = "true" ]; then
-        if [ "$LC_DISABLE_BRANCHES" = "true" ]; then
-            if ! commit_on_current_branch "$iteration_display"; then
-                echo "❌ $iteration_display Failed to commit all files. Stopping." >&2
-                exit 1
-            fi
-        else
-            if ! linear_claude_commit "$iteration_display" "$branch_name" "$main_branch" "$notes_file"; then
-                echo "❌ $iteration_display Failed to commit all files. Stopping." >&2
-                exit 1
-            fi
-        fi
-    else
-        echo "⏭️  $iteration_display Skipping commits (--disable-commits flag set)" >&2
-        if [ -n "$branch_name" ] && git rev-parse --git-dir > /dev/null 2>&1; then
+    if [ "$has_commits" = "false" ] && [ "$has_uncommitted" = "false" ]; then
+        echo "🫙 $iteration_display No changes detected, cleaning up branch..." >&2
+        if [ -n "$branch_name" ]; then
             git checkout "$main_branch" >/dev/null 2>&1
             git branch -D "$branch_name" >/dev/null 2>&1 || true
         fi
+        return 0
     fi
 
-    error_count=0
-    if [ $extra_iterations -gt 0 ]; then
-        extra_iterations=$((extra_iterations - 1))
-    fi
-    successful_iterations=$((successful_iterations + 1))
-    return 0
-}
-
-handle_claude_questions() {
-    local result="$1"
-    local notes_file="$2"
-    local iteration_display="$3"
-
-    # Extract AskUserQuestion tool calls from the JSON stream
-    local questions_json
-    questions_json=$(echo "$result" | jq -s '[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "AskUserQuestion") | .input.questions[]?]' 2>/dev/null)
-
-    if [ -z "$questions_json" ] || [ "$questions_json" = "[]" ] || [ "$questions_json" = "null" ]; then
-        return 1  # No questions found
+    if [ "$LC_DRY_RUN" = "true" ]; then
+        echo "📤 $iteration_display (DRY RUN) Would verify push..." >&2
+        return 0
     fi
 
-    local question_count
-    question_count=$(echo "$questions_json" | jq length 2>/dev/null)
-
-    if [ -z "$question_count" ] || [ "$question_count" -eq 0 ]; then
-        return 1
+    # Check if branch was pushed
+    if [ -n "$branch_name" ] && [ "$has_commits" = "true" ]; then
+        local remote_ref
+        remote_ref=$(git ls-remote --heads origin "$branch_name" 2>/dev/null | head -n 1)
+        if [ -z "$remote_ref" ]; then
+            echo "📤 $iteration_display Branch not pushed, pushing now..." >&2
+            if ! git push -u origin "$branch_name" >/dev/null 2>&1; then
+                echo "⚠️  $iteration_display Failed to push branch — will retry manually" >&2
+                LC_UNPUSHED_BRANCHES+=("$branch_name")
+            else
+                echo "✅ $iteration_display Pushed branch: $branch_name" >&2
+            fi
+        else
+            echo "✅ $iteration_display Branch already pushed: $branch_name" >&2
+        fi
     fi
 
-    echo "" >&2
-    echo "❓ $iteration_display Claude needs your input:" >&2
-    echo "" >&2
+    # Create PR if requested
+    if [ "$LC_OPEN_PR" = "true" ] && [ -n "$branch_name" ] && [[ ! " ${LC_UNPUSHED_BRANCHES[*]} " =~ " ${branch_name} " ]]; then
+        # Check if PR already exists
+        local existing_pr
+        existing_pr=$(gh pr list --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --head "$branch_name" --json number --jq '.[0].number' 2>/dev/null)
+        if [ -n "$existing_pr" ]; then
+            echo "ℹ️  $iteration_display PR #$existing_pr already exists for $branch_name" >&2
+        else
+            echo "🔨 $iteration_display Creating pull request..." >&2
+            local commit_message
+            commit_message=$(git log -1 --format="%B" "$branch_name")
+            local commit_title
+            commit_title=$(echo "$commit_message" | head -n 1)
+            local commit_body
+            commit_body=$(echo "$commit_message" | tail -n +3)
 
-    local answers=""
-    local q_idx=0
+            local pr_output
+            if ! pr_output=$(gh pr create --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch" --draft 2>&1); then
+                echo "⚠️  $iteration_display Failed to create PR: $pr_output" >&2
+            else
+                local pr_number
+                pr_number=$(echo "$pr_output" | grep -oE '(pull/|#)[0-9]+' | grep -oE '[0-9]+' | head -n 1)
+                echo "✅ $iteration_display PR #$pr_number created: $commit_title" >&2
 
-    while [ $q_idx -lt "$question_count" ]; do
-        local question_text
-        question_text=$(echo "$questions_json" | jq -r ".[$q_idx].question // \"\"")
+                # Post notes as a PR comment
+                if [ -n "$pr_number" ] && [ -n "$notes_file" ] && [ -f "$notes_file" ]; then
+                    local notes_content
+                    notes_content=$(cat "$notes_file")
+                    if [ -n "$notes_content" ]; then
+                        local comment_body="## Claude's Notes
 
-        local options
-        options=$(echo "$questions_json" | jq -r ".[$q_idx].options // []")
-        local opt_count
-        opt_count=$(echo "$options" | jq length 2>/dev/null || echo 0)
-
-        echo "  $question_text" >&2
-
-        if [ "$opt_count" -gt 0 ]; then
-            echo "" >&2
-            local o_idx=0
-            while [ $o_idx -lt "$opt_count" ]; do
-                local label desc
-                label=$(echo "$options" | jq -r ".[$o_idx].label // \"\"")
-                desc=$(echo "$options" | jq -r ".[$o_idx].description // empty")
-                printf "    %d) %s" "$((o_idx + 1))" "$label" >&2
-                if [ -n "$desc" ]; then
-                    printf " — %s" "$desc" >&2
+$notes_content"
+                        if gh pr comment "$pr_number" --repo "$LC_GITHUB_OWNER/$LC_GITHUB_REPO" --body "$comment_body" >/dev/null 2>&1; then
+                            echo "💬 $iteration_display Posted notes as PR comment" >&2
+                        else
+                            echo "⚠️  $iteration_display Failed to post notes as PR comment" >&2
+                        fi
+                    fi
                 fi
-                echo "" >&2
-                o_idx=$((o_idx + 1))
-            done
-            echo "" >&2
+            fi
         fi
+    fi
 
-        local answer
-        read -r -p "  > " answer </dev/tty
-        echo "" >&2
-
-        # Resolve numbered option to label
-        if [ "$opt_count" -gt 0 ] && [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le "$opt_count" ]; then
-            answer=$(echo "$options" | jq -r ".[$(($answer - 1))].label // \"$answer\"")
+    # Return to main branch
+    if [ -n "$branch_name" ]; then
+        if ! git checkout "$main_branch" >/dev/null 2>&1; then
+            echo "⚠️  $iteration_display Failed to checkout $main_branch" >&2
+            return 1
         fi
+    fi
 
-        answers+="Q: $question_text
-A: $answer
-
-"
-        q_idx=$((q_idx + 1))
-    done
-
-    # Export answers for the caller to accumulate
-    LC_LAST_ANSWERS="$answers"
-
-    # Save Q&A to the notes file
-    mkdir -p "$(dirname "$notes_file")"
-    {
-        if [ -f "$notes_file" ]; then
-            cat "$notes_file"
-            echo ""
-        fi
-        echo "## Answers from user"
-        echo ""
-        printf "%s" "$answers"
-    } > "${notes_file}.tmp" && mv "${notes_file}.tmp" "$notes_file"
-
-    echo "💾 $iteration_display Answers saved to $notes_file" >&2
     return 0
 }
 
@@ -1421,7 +1119,12 @@ execute_single_iteration() {
         if [ $? -ne 0 ] || [ -z "$branch_name" ]; then
             if git rev-parse --git-dir > /dev/null 2>&1; then
                 echo "❌ $iteration_display Failed to create branch" >&2
-                handle_iteration_error "$iteration_display" "exit_code" ""
+                error_count=$((error_count + 1))
+                extra_iterations=$((extra_iterations + 1))
+                if [ $error_count -ge 3 ]; then
+                    echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
+                    exit 1
+                fi
                 return 1
             fi
             branch_name=""
@@ -1430,112 +1133,84 @@ execute_single_iteration() {
 
     mkdir -p "$LC_NOTES_DIR"
 
-    local max_question_rounds=3
-    local question_round=0
-    local result=""
-    local accumulated_answers=""
-
-    while [ $question_round -lt $max_question_rounds ]; do
-        local enhanced_prompt="${LC_PROMPT_WORKFLOW_CONTEXT//COMPLETION_SIGNAL_PLACEHOLDER/$LC_COMPLETION_SIGNAL}
+    # Build the prompt
+    local enhanced_prompt="${LC_PROMPT_WORKFLOW_CONTEXT//COMPLETION_SIGNAL_PLACEHOLDER/$LC_COMPLETION_SIGNAL}
 
 $LC_PROMPT
 
 "
 
-        if [ -f "$notes_file" ]; then
-            local notes_content
-            notes_content=$(cat "$notes_file")
-            enhanced_prompt+="## CONTEXT FROM PREVIOUS ITERATION
+    if [ -f "$notes_file" ]; then
+        local notes_content
+        notes_content=$(cat "$notes_file")
+        enhanced_prompt+="## CONTEXT FROM PREVIOUS ITERATION
 
 The following notes were saved from a previous iteration working on this ticket ($notes_file):
 
 $notes_content
 
 "
-        fi
+    fi
 
-        if [ -n "$accumulated_answers" ]; then
-            enhanced_prompt+="## USER ANSWERS TO YOUR PREVIOUS QUESTIONS
-
-IMPORTANT: These questions have already been answered by the user. Do NOT ask them again. Use these answers and proceed with the implementation.
-
-$accumulated_answers
-"
-        fi
-
-        enhanced_prompt+="## ITERATION NOTES
-
-"
-
-        if [ -f "$notes_file" ]; then
-            enhanced_prompt+="Update the \`$notes_file\` file with relevant context for the next iteration. Add new notes and remove outdated information to keep it current and useful."
-        else
-            enhanced_prompt+="Create a \`$notes_file\` file with relevant context and instructions for the next iteration."
-        fi
-
-        enhanced_prompt+="$LC_PROMPT_NOTES_GUIDELINES"
-
-        echo "🤖 $iteration_display Running Claude Code..." >&2
-
-        local claude_exit_code=0
-        result=$(run_claude_iteration "$enhanced_prompt" "$LC_ADDITIONAL_FLAGS" "$LC_ERROR_LOG" "$iteration_display") || claude_exit_code=$?
-
-        if [ $claude_exit_code -ne 0 ]; then
-            echo "" >&2
-            echo "⚠️  Claude Code command failed with exit code: $claude_exit_code" >&2
-            if [ -n "$branch_name" ] && git rev-parse --git-dir > /dev/null 2>&1; then
-                git checkout "$main_branch" >/dev/null 2>&1
-                git branch -D "$branch_name" >/dev/null 2>&1 || true
-            fi
-            handle_iteration_error "$iteration_display" "exit_code" ""
-            return 1
-        fi
-
-        # Save result to notes dir
-        if [ -n "$result" ]; then
-            echo "$result" > "${LC_NOTES_DIR}/$(date +%Y%m%d-%H%M%S)-${identifier}.json"
-        fi
-
-        local parse_result=$(parse_claude_result "$result")
-        if [ "$?" != "0" ]; then
-            if [ -n "$branch_name" ] && git rev-parse --git-dir > /dev/null 2>&1; then
-                git checkout "$main_branch" >/dev/null 2>&1
-                git branch -D "$branch_name" >/dev/null 2>&1 || true
-            fi
-            handle_iteration_error "$iteration_display" "$parse_result" "$result"
-            return 1
-        fi
-
-        # Check if Claude asked questions — if so, collect answers and re-run
-        if handle_claude_questions "$result" "$notes_file" "$iteration_display"; then
-            accumulated_answers+="$LC_LAST_ANSWERS"
-            question_round=$((question_round + 1))
-            echo "🔄 $iteration_display Re-running with user answers (round $((question_round + 1))/$max_question_rounds)..." >&2
-            continue
-        fi
-
-        break
-    done
-
-    # Run reviewer pass if LC_REVIEW_PROMPT is set
+    # Append review prompt if set
     if [ -n "$LC_REVIEW_PROMPT" ]; then
-        if ! run_reviewer_iteration "$iteration_display" "$LC_REVIEW_PROMPT" "$LC_ERROR_LOG"; then
-            echo "❌ $iteration_display Reviewer failed, aborting iteration" >&2
-            if [ -n "$branch_name" ] && git rev-parse --git-dir > /dev/null 2>&1; then
-                git checkout "$main_branch" >/dev/null 2>&1
-                git branch -D "$branch_name" >/dev/null 2>&1 || true
-            fi
-            error_count=$((error_count + 1))
-            extra_iterations=$((extra_iterations + 1))
-            if [ $error_count -ge 3 ]; then
-                echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
-                exit 1
-            fi
-            return 1
+        enhanced_prompt+="## ADDITIONAL REVIEW INSTRUCTIONS
+
+After completing the work, also review your changes for: $LC_REVIEW_PROMPT
+
+"
+    fi
+
+    enhanced_prompt+="## ITERATION NOTES
+
+"
+
+    if [ -f "$notes_file" ]; then
+        enhanced_prompt+="Update the \`$notes_file\` file with relevant context for the next iteration. Add new notes and remove outdated information to keep it current and useful."
+    else
+        enhanced_prompt+="Create a \`$notes_file\` file with relevant context and instructions for the next iteration."
+    fi
+
+    enhanced_prompt+="$LC_PROMPT_NOTES_GUIDELINES"
+
+    echo "🤖 $iteration_display Launching Claude Code interactively..." >&2
+
+    local claude_exit_code=0
+    run_claude_interactive "$enhanced_prompt" "$LC_ALLOWED_TOOLS" || claude_exit_code=$?
+
+    if [ $claude_exit_code -ne 0 ]; then
+        echo "" >&2
+        echo "⚠️  Claude Code exited with code: $claude_exit_code" >&2
+        if [ -n "$branch_name" ] && git rev-parse --git-dir > /dev/null 2>&1; then
+            git checkout "$main_branch" >/dev/null 2>&1
+            git branch -D "$branch_name" >/dev/null 2>&1 || true
+        fi
+        error_count=$((error_count + 1))
+        extra_iterations=$((extra_iterations + 1))
+        if [ $error_count -ge 3 ]; then
+            echo "❌ Fatal: 3 consecutive errors occurred. Exiting." >&2
+            exit 1
+        fi
+        return 1
+    fi
+
+    # Post-session: verify commit and push
+    echo "✅ $iteration_display Claude session completed" >&2
+    if [ "$LC_ENABLE_COMMITS" = "true" ]; then
+        verify_commit_and_push "$iteration_display" "$branch_name" "$main_branch" "$notes_file"
+    else
+        echo "⏭️  $iteration_display Skipping commit verification (--disable-commits flag set)" >&2
+        if [ -n "$branch_name" ] && git rev-parse --git-dir > /dev/null 2>&1; then
+            git checkout "$main_branch" >/dev/null 2>&1
+            git branch -D "$branch_name" >/dev/null 2>&1 || true
         fi
     fi
 
-    handle_iteration_success "$iteration_display" "$result" "$branch_name" "$main_branch" "$notes_file"
+    error_count=0
+    if [ $extra_iterations -gt 0 ]; then
+        extra_iterations=$((extra_iterations - 1))
+    fi
+    successful_iterations=$((successful_iterations + 1))
     return 0
 }
 
@@ -1696,7 +1371,9 @@ handle_in_review_issue() {
     # Build the review prompt
     local review_prompt="## CODE REVIEW RESOLUTION: $identifier — $title
 
-You are resolving review comments and CI failures on PR #$pr_number in $pr_owner/$pr_repo (branch: $branch_name)."
+You are resolving review comments and CI failures on PR #$pr_number in $pr_owner/$pr_repo (branch: $branch_name).
+
+**When you're done**: Stage all changes with \`git add .\`, commit with a clear message, and push the branch."
 
     if [ "$has_ci_failures" = "true" ]; then
         review_prompt+="
@@ -1729,7 +1406,7 @@ $conversation_comments"
 3. Fix any CI failures — read the error logs carefully and fix the root cause
 4. If a comment is unclear or you disagree, make your best judgment
 5. Focus on addressing the feedback and fixing CI, not adding unrelated changes
-6. Do NOT commit or push changes — the automation will handle that"
+6. When done, stage all changes, commit with a clear message, and push the branch"
 
     # Fetch and checkout the PR branch
     echo "🌿 $iteration_display Checking out PR branch: $branch_name" >&2
@@ -1742,18 +1419,10 @@ $conversation_comments"
     fi
     git reset --hard "origin/$branch_name" >/dev/null 2>&1 || true
 
-    echo "🤖 $iteration_display Running Claude Code to resolve review comments..." >&2
+    echo "🤖 $iteration_display Launching Claude Code to resolve review comments..." >&2
 
-    local result
     local claude_exit_code=0
-    LC_PROMPT="$review_prompt"
-    result=$(run_claude_iteration "$review_prompt" "$LC_ADDITIONAL_FLAGS" "$LC_ERROR_LOG" "$iteration_display") || claude_exit_code=$?
-
-    # Save result
-    if [ -n "$result" ]; then
-        mkdir -p "$LC_NOTES_DIR"
-        echo "$result" > "${LC_NOTES_DIR}/$(date +%Y%m%d-%H%M%S)-${identifier}-review.json"
-    fi
+    run_claude_interactive "$review_prompt" "$LC_ALLOWED_TOOLS" || claude_exit_code=$?
 
     if [ $claude_exit_code -ne 0 ]; then
         echo "⚠️  $iteration_display Claude Code failed for review resolution" >&2
@@ -1761,33 +1430,18 @@ $conversation_comments"
         return 1
     fi
 
-    # Extract cost
-    local cost=$(echo "$result" | jq -s -r '.[-1].total_cost_usd // empty')
-    if [ -n "$cost" ]; then
-        printf "💰 $iteration_display Review resolution cost: \$%.3f\n" "$cost" >&2
-        total_cost=$(awk "BEGIN {printf \"%.3f\", $total_cost + $cost}")
-        printf "   Running total: \$%.3f\n" "$total_cost" >&2
-    fi
+    # Verify push happened
+    echo "🔍 $iteration_display Verifying push for review fixes..." >&2
+    local local_sha
+    local_sha=$(git rev-parse HEAD 2>/dev/null)
+    local remote_sha
+    remote_sha=$(git ls-remote origin "$branch_name" 2>/dev/null | awk '{print $1}')
 
-    # Commit and push if there are changes
-    local has_changes=false
-    if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty; then
-        has_changes=true
-    fi
-    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
-        has_changes=true
-    fi
-
-    if [ "$has_changes" = "true" ]; then
-        echo "💬 $iteration_display Committing review fixes..." >&2
-        if claude -p "$LC_PROMPT_COMMIT_MESSAGE" --allowedTools "Bash(git)" >/dev/null 2>&1; then
-            echo "📤 $iteration_display Pushing review fixes..." >&2
-            git push origin "$branch_name" >/dev/null 2>&1 || echo "⚠️  $iteration_display Failed to push review fixes" >&2
-        else
-            echo "⚠️  $iteration_display Failed to commit review fixes" >&2
-        fi
+    if [ "$local_sha" != "$remote_sha" ]; then
+        echo "📤 $iteration_display Pushing review fixes..." >&2
+        git push origin "$branch_name" >/dev/null 2>&1 || echo "⚠️  $iteration_display Failed to push review fixes" >&2
     else
-        echo "ℹ️  $iteration_display No changes needed for review comments" >&2
+        echo "✅ $iteration_display Review fixes already pushed" >&2
     fi
 
     # Return to main branch
@@ -1886,10 +1540,6 @@ main_loop_linear_view() {
             should_continue=false
         fi
 
-        if [ -n "$LC_MAX_COST" ] && [ "$(awk "BEGIN {print ($total_cost >= $LC_MAX_COST)}")" = "1" ]; then
-            should_continue=false
-        fi
-
         if [ -n "$LC_MAX_DURATION" ] && [ -n "$start_time" ]; then
             local current_time
             current_time=$(date +%s)
@@ -1947,8 +1597,8 @@ main_loop_linear_view() {
         local state_lower
         state_lower=$(echo "$state" | tr '[:upper:]' '[:lower:]')
 
-        echo "" >&2
-        echo "📋 Processing issue $((issue_index + 1))/$issue_count: $identifier — $title (state: $state)" >&2
+        # Print issue header
+        print_issue_header "$identifier" "$title" "$state" "$((issue_index + 1))" "$issue_count"
 
         # Abort if there are uncommitted changes
         if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
@@ -1964,13 +1614,19 @@ main_loop_linear_view() {
         git reset --hard origin/main >/dev/null 2>&1 || { echo "❌ Error: Failed to reset to origin/main" >&2; exit 1; }
 
         # Status-based routing
+        local result_status=""
         case "$state_lower" in
             "done"|"in progress")
                 echo "⏭️  Skipping $identifier — status is '$state'" >&2
+                result_status="Skip"
                 ;;
             "in review")
                 local iteration_display=$(get_iteration_display $i "${LC_MAX_RUNS:-0}" $extra_iterations)
-                handle_in_review_issue "$identifier" "$title" "$branch_name" "$iteration_display" "$pr_url"
+                if handle_in_review_issue "$identifier" "$title" "$branch_name" "$iteration_display" "$pr_url"; then
+                    result_status="Done"
+                else
+                    result_status="Fail"
+                fi
                 i=$((i + 1))
                 ;;
             *)
@@ -1983,10 +1639,17 @@ $description
 
 Implement the changes described in this Linear issue. Focus on making meaningful, well-tested progress."
 
-                execute_single_iteration $i "$branch_name" "$identifier"
+                if execute_single_iteration $i "$branch_name" "$identifier"; then
+                    result_status="Done"
+                else
+                    result_status="Fail"
+                fi
                 i=$((i + 1))
                 ;;
         esac
+
+        # Record result for summary
+        LC_SUMMARY_RESULTS+=("$identifier|$title|$result_status|$branch_name")
 
         sleep 1
         issue_index=$((issue_index + 1))
@@ -1994,6 +1657,7 @@ Implement the changes described in this Linear issue. Focus on making meaningful
 }
 
 show_completion_summary() {
+    reset_terminal_title
     local elapsed_msg=""
     if [ -n "$start_time" ]; then
         local current_time=$(date +%s)
@@ -2001,19 +1665,68 @@ show_completion_summary() {
         elapsed_msg=" (elapsed: $(format_duration $elapsed_time))"
     fi
 
-    if [ $completion_signal_count -ge $LC_COMPLETION_THRESHOLD ]; then
-        if [ -n "$total_cost" ] && [ "$(awk "BEGIN {print ($total_cost > 0)}")" = "1" ]; then
-            printf "✨ Project completed! Detected completion signal %d times in a row. Total cost: \$%.3f%s\n" "$completion_signal_count" "$total_cost" "$elapsed_msg"
-        else
-            printf "✨ Project completed! Detected completion signal %d times in a row.%s\n" "$completion_signal_count" "$elapsed_msg"
-        fi
-    elif [ -n "$LC_MAX_RUNS" ] && [ "$LC_MAX_RUNS" -ne 0 ] || [ -n "$LC_MAX_COST" ] || [ -n "$LC_MAX_DURATION" ]; then
-        if [ -n "$total_cost" ] && [ "$(awk "BEGIN {print ($total_cost > 0)}")" = "1" ]; then
-            printf "🎉 Done with total cost: \$%.3f%s\n" "$total_cost" "$elapsed_msg"
-        else
-            printf "🎉 Done%s\n" "$elapsed_msg"
-        fi
+    echo "" >&2
+    echo "========================================" >&2
+    echo "  LINEAR-CLAUDE SUMMARY$elapsed_msg" >&2
+    echo "========================================" >&2
+    echo "" >&2
+
+    if [ ${#LC_SUMMARY_RESULTS[@]} -gt 0 ]; then
+        # Calculate column widths
+        local max_id=7 max_title=5 max_result=6 max_branch=6
+        for entry in "${LC_SUMMARY_RESULTS[@]}"; do
+            IFS='|' read -r sid stitle sresult sbranch <<< "$entry"
+            [ ${#sid} -gt $max_id ] && max_id=${#sid}
+            # Truncate title for display
+            local display_title="${stitle:0:30}"
+            [ ${#display_title} -gt $max_title ] && max_title=${#display_title}
+            [ ${#sresult} -gt $max_result ] && max_result=${#sresult}
+            [ ${#sbranch} -gt $max_branch ] && max_branch=${#sbranch}
+        done
+
+        # Cap max widths
+        [ $max_title -gt 30 ] && max_title=30
+        [ $max_branch -gt 40 ] && max_branch=40
+
+        # Print header
+        printf "  %-${max_id}s  %-${max_title}s  %-${max_result}s  %-${max_branch}s\n" "Issue" "Title" "Result" "Branch" >&2
+        local header_len=$((max_id + max_title + max_result + max_branch + 6))
+        local header_line=""
+        local idx=0
+        while [ $idx -lt $header_len ]; do
+            header_line+="-"
+            idx=$((idx + 1))
+        done
+        printf "  %s\n" "$header_line" >&2
+
+        # Print rows
+        for entry in "${LC_SUMMARY_RESULTS[@]}"; do
+            IFS='|' read -r sid stitle sresult sbranch <<< "$entry"
+            local display_title="${stitle:0:30}"
+            local result_icon=""
+            case "$sresult" in
+                "Done") result_icon="Done" ;;
+                "Skip") result_icon="Skip" ;;
+                "Fail") result_icon="Fail" ;;
+                *) result_icon="$sresult" ;;
+            esac
+            [ -z "$sbranch" ] && sbranch="-"
+            printf "  %-${max_id}s  %-${max_title}s  %-${max_result}s  %-${max_branch}s\n" "$sid" "$display_title" "$result_icon" "$sbranch" >&2
+        done
+        echo "" >&2
     fi
+
+    if [ ${#LC_UNPUSHED_BRANCHES[@]} -gt 0 ]; then
+        echo "⚠️  The following branches were not pushed and need attention:" >&2
+        for branch in "${LC_UNPUSHED_BRANCHES[@]}"; do
+            echo "   - $branch" >&2
+        done
+        echo "" >&2
+    fi
+
+    echo "Done.$elapsed_msg" >&2
+
+    reset_terminal_title
 }
 
 cmd_view() {
@@ -2022,11 +1735,9 @@ cmd_view() {
     validate_arguments
     validate_requirements
 
-    LC_ERROR_LOG=$(mktemp)
     LC_INTERRUPTED=false
-    LC_CLAUDE_PID_FILE=$(mktemp)
-    trap 'echo "" >&2; echo "⛔ Interrupted — killing claude and exiting..." >&2; LC_TRAP_PID=$(cat "$LC_CLAUDE_PID_FILE" 2>/dev/null); if [ -n "$LC_TRAP_PID" ] && kill -0 "$LC_TRAP_PID" 2>/dev/null; then kill "$LC_TRAP_PID" 2>/dev/null; fi; exit 130' INT TERM
-    trap "rm -f $LC_ERROR_LOG $LC_CLAUDE_PID_FILE" EXIT
+    trap 'echo "" >&2; echo "⛔ Interrupted — exiting..." >&2; LC_INTERRUPTED=true; reset_terminal_title' INT TERM
+    trap '' EXIT
 
     fetch_linear_view_issues || exit 1
     main_loop_linear_view

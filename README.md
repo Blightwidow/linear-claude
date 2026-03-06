@@ -1,5 +1,9 @@
 # Linear Claude
 
+> **Warning:** This project is **experimental** and should be used with caution. It runs Claude Code autonomously on your codebase — review its changes carefully. While it does not use `--dangerously-skip-permissions`, it still creates branches, commits, and pushes code on your behalf.
+>
+> This project is **not affiliated with, endorsed by, or connected to** the [Linear](https://linear.app) team in any way. It is an independent tool that uses the Linear API via the community [Linear CLI](https://github.com/schpet/linear).
+
 Run Claude Code iteratively on [Linear](https://linear.app) issues — derived from [Continuous Claude](https://github.com/AnandChowdhary/continuous-claude) by Anand Chowdhary.
 
 Instead of a free-form prompt, Linear Claude fetches issues from a Linear custom view and runs Claude Code on each one, creating branches, committing changes, pushing, and optionally opening PRs. Issues are routed by status: "todo"/"backlog" issues get implemented, "in review" issues get their CI failures and PR review comments addressed, and "done"/"in progress" issues are skipped.
@@ -88,7 +92,7 @@ linear-claude version
 * `--owner <owner>`: GitHub repository owner (auto-detected from git remote if not provided)
 * `--repo <repo>`: GitHub repository name (auto-detected from git remote if not provided)
 * `--git-branch-prefix <prefix>`: Prefix for git branch names (default: `linear-claude/`)
-* `--notes-file <file>`: Shared notes file for iteration context (default: `SHARED_TASK_NOTES.md`)
+* `--notes-dir <dir>`: Directory for per-ticket notes files (default: `./.claude/plans`)
 * `--disable-commits`: Disable automatic commits and PR creation
 * `--disable-branches`: Commit on current branch without creating branches or PRs
 * `--open-pr`: Create a PR after pushing (default: no PR created)
