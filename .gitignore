@@ -1,0 +1,58 @@
+.bash_history
+
+# PyCharm
+.idea/
+*.iml
+.run/*
+!.run/*.run.xml
+# in case engs need to add personal run configurations
+.run/*.untracked.run.xml
+
+# VSCode
+.vscode/*
+!.vscode/i18n-ally-custom-framework.yml
+!.vscode/README.md
+!.vscode/launch.json.default
+!.vscode/extensions.json
+!.vscode/settings.json.default
+!.vscode/tasks.json.default
+!.vscode/install-custom-mypy-ext.sh
+
+# For Macs
+.DS_Store
+
+# Homebrew bundle lock
+# NOTE: Homebrew does not support version pinning like `pip` or `yarn`.
+# The lock file is purely for diagnosis purposes, and is therefore better ignored.
+# Please refer to the [official documentation](https://github.com/Homebrew/homebrew-bundle#note) for further details.
+Brewfile.lock.json
+
+tmp
+.direnv
+
+# For Emacs Projectile
+.projectile
+
+# For Emacs temporary and auto-save files
+\#*\#
+*~
+
+# VSCode REST Client extension file
+requests.http
+
+# Cursor
+.specstory/*
+.cursorindexingignore
+
+# Claude code
+**/.claude/settings.local.json
+CLAUDE.local.md
+**/.claude/plans
+
+# Xcode
+.xcode.env.local
+
+# Vim
+*.sw?
+
+.mypy_cache
