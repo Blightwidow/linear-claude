@@ -7,19 +7,22 @@ mod github;
 mod iteration;
 mod linear;
 mod prompt;
-mod pty;
 mod summary;
+mod tui;
 mod update;
 mod version;
 
 use clap::Parser;
 use cli::{Cli, Commands};
 use config::Config;
+use linear::types::LinearIssue;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::sync::Arc;
+use tui::app::{App, IssueDisplayStatus, IssueEntry};
+use tui::event::{AppEvent, EventSystem};
 
 fn main() {
-    // Load .env file if present (non-fatal)
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
@@ -64,12 +67,10 @@ fn cmd_view(args: cli::ViewArgs) {
     update::check_for_updates();
     validate_requirements(&config);
 
-    // Set up signal handling
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_clone = interrupted.clone();
     ctrlc_setup(interrupted_clone);
 
-    // Fetch issues
     let issues = if config.dry_run {
         eprintln!("(DRY RUN) Would fetch Linear view issues from: {}", config.linear_view);
         Vec::new()
@@ -86,17 +87,7 @@ fn cmd_view(args: cli::ViewArgs) {
         }
     };
 
-    let mut state = iteration::IterationState::new(interrupted);
-
-    if let Err(e) = iteration::main_loop(&config, &issues, &mut state) {
-        eprintln!("Error: {e}");
-    }
-
-    // Reset terminal title
-    let mut stdout = std::io::stderr();
-    pty::header::reset_terminal_title(&mut stdout).ok();
-
-    summary::show_completion_summary(&state.summary_results, &state.unpushed_branches, state.start_time);
+    run_with_issues(config, issues, interrupted);
 }
 
 fn cmd_ticket(args: cli::TicketArgs) {
@@ -132,16 +123,139 @@ fn cmd_ticket(args: cli::TicketArgs) {
         }
     };
 
+    run_with_issues(config, issues, interrupted);
+}
+
+fn run_with_issues(config: Config, issues: Vec<LinearIssue>, interrupted: Arc<AtomicBool>) {
+    if config.no_tui {
+        run_headless(config, issues, interrupted);
+    } else {
+        run_tui(config, issues, interrupted);
+    }
+}
+
+fn run_headless(config: Config, issues: Vec<LinearIssue>, interrupted: Arc<AtomicBool>) {
     let mut state = iteration::IterationState::new(interrupted);
 
-    if let Err(e) = iteration::main_loop(&config, &issues, &mut state) {
+    if let Err(e) = iteration::headless_loop(&config, &issues, &mut state) {
         eprintln!("Error: {e}");
     }
 
-    let mut stdout = std::io::stderr();
-    pty::header::reset_terminal_title(&mut stdout).ok();
-
     summary::show_completion_summary(&state.summary_results, &state.unpushed_branches, state.start_time);
+}
+
+fn run_tui(config: Config, issues: Vec<LinearIssue>, interrupted: Arc<AtomicBool>) {
+    tui::install_panic_hook();
+
+    let issue_entries: Vec<IssueEntry> = issues
+        .iter()
+        .map(|i| IssueEntry {
+            identifier: i.identifier.clone(),
+            title: i.title.clone(),
+            status: IssueDisplayStatus::Queued,
+        })
+        .collect();
+
+    let mut app = App::new(issue_entries);
+
+    let mut terminal = match tui::init_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: Failed to initialize terminal: {e}");
+            // Fall back to headless
+            run_headless(config, issues, interrupted);
+            return;
+        }
+    };
+
+    let mut events = EventSystem::new();
+    events.start_input_thread();
+
+    // Take cmd_rx out for the worker thread
+    let cmd_rx = events.cmd_rx.take().unwrap();
+    let event_tx = events.app_tx.clone();
+
+    // Spawn worker thread
+    let worker_handle = std::thread::spawn(move || {
+        let mut state = iteration::IterationState::new(interrupted);
+        iteration::worker_loop(&config, &issues, &mut state, event_tx, cmd_rx);
+        state
+    });
+
+    // Main event loop
+    loop {
+        // Draw
+        if let Err(e) = terminal.draw(|frame| tui::ui::draw(frame, &mut app)) {
+            eprintln!("Draw error: {e}");
+            break;
+        }
+
+        // Process events
+        let visible_height = tui::ui::output_visible_height(terminal.size().map(|s| s.height).unwrap_or(24));
+
+        match events.app_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(event) => {
+                match event {
+                    AppEvent::Key(key) => {
+                        if tui::event::handle_key(key, &mut app, &events.cmd_tx, visible_height) {
+                            break;
+                        }
+                    }
+                    AppEvent::Tick => {}
+                    AppEvent::IssueStatusChanged { index, status } => {
+                        // Update counters
+                        match &status {
+                            IssueDisplayStatus::Done => app.done_count += 1,
+                            IssueDisplayStatus::Failed => app.failed_count += 1,
+                            IssueDisplayStatus::Skipped => app.skipped_count += 1,
+                            _ => {}
+                        }
+                        if let Some(entry) = app.issues.get_mut(index) {
+                            entry.status = status;
+                        }
+                    }
+                    AppEvent::BranchChanged(branch) => {
+                        app.current_branch = branch;
+                    }
+                    AppEvent::ClaudeOutput(line) => {
+                        app.push_output_line(line);
+                    }
+                    AppEvent::ClaudeFinished(_code) => {}
+                    AppEvent::OutputCleared => {
+                        app.clear_output();
+                    }
+                    AppEvent::LogMessage(msg) => {
+                        app.push_log_line(msg.clone());
+                        app.push_output_line(format!("# {msg}"));
+                    }
+                    AppEvent::WorkerDone => {
+                        app.worker_done = true;
+                        app.push_output_line(String::new());
+                        app.push_output_line("--- Worker finished. Press q to exit. ---".into());
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if app.should_quit && app.worker_done {
+            break;
+        }
+    }
+
+    // Restore terminal
+    tui::restore_terminal(&mut terminal);
+
+    // Wait for worker and get final state
+    match worker_handle.join() {
+        Ok(state) => {
+            summary::show_completion_summary(&state.summary_results, &state.unpushed_branches, state.start_time);
+        }
+        Err(_) => {
+            eprintln!("Worker thread panicked");
+        }
+    }
 }
 
 fn validate_requirements(config: &Config) {

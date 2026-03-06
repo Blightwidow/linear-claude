@@ -4,12 +4,15 @@ use crate::git;
 use crate::github::client::GitHubClient;
 use crate::linear::types::{IssueStatus, LinearIssue};
 use crate::prompt;
-use crate::pty::header;
 use crate::summary::{SummaryEntry, SummaryResult};
+use crate::tui::app::IssueDisplayStatus;
+use crate::tui::claude_runner;
+use crate::tui::event::{AppEvent, WorkerCommand};
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct IterationState {
     pub error_count: u32,
@@ -37,8 +40,216 @@ impl IterationState {
     }
 }
 
-/// Main loop: iterate over Linear issues with status-based routing.
-pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationState) -> Result<()> {
+/// Worker thread entry point for TUI mode.
+/// Processes issues and sends events back to the TUI.
+pub fn worker_loop(
+    config: &Config,
+    issues: &[LinearIssue],
+    state: &mut IterationState,
+    event_tx: mpsc::Sender<AppEvent>,
+    cmd_rx: mpsc::Receiver<WorkerCommand>,
+) {
+    if let Err(e) = worker_loop_inner(config, issues, state, &event_tx, &cmd_rx) {
+        let _ = event_tx.send(AppEvent::LogMessage(format!("Error: {e}")));
+    }
+    let _ = event_tx.send(AppEvent::WorkerDone);
+}
+
+fn worker_loop_inner(
+    config: &Config,
+    issues: &[LinearIssue],
+    state: &mut IterationState,
+    event_tx: &mpsc::Sender<AppEvent>,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+) -> Result<()> {
+    if config.max_duration.is_some() {
+        state.start_time = Some(Instant::now());
+    }
+
+    if issues.is_empty() {
+        let _ = event_tx.send(AppEvent::LogMessage("No issues found, nothing to do.".into()));
+        return Ok(());
+    }
+
+    let github = if config.enable_commits {
+        GitHubClient::new().ok()
+    } else {
+        None
+    };
+
+    for (issue_index, issue) in issues.iter().enumerate() {
+        // Check for quit command
+        if check_quit(cmd_rx) || state.interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Check limits
+        if let Some(max_runs) = config.max_runs {
+            if max_runs != 0 && state.successful_iterations >= max_runs {
+                break;
+            }
+        }
+
+        if let Some(max_dur) = config.max_duration {
+            if let Some(start) = state.start_time {
+                if start.elapsed() >= max_dur {
+                    let _ = event_tx.send(AppEvent::LogMessage(format!(
+                        "Time limit reached ({})",
+                        crate::duration::format_duration(start.elapsed().as_secs())
+                    )));
+                    break;
+                }
+            }
+        }
+
+        // Clear output for new issue
+        let _ = event_tx.send(AppEvent::OutputCleared);
+        let _ = event_tx.send(AppEvent::IssueStatusChanged {
+            index: issue_index,
+            status: IssueDisplayStatus::Running,
+        });
+
+        let _ = event_tx.send(AppEvent::LogMessage(format!(
+            "Processing {} -- {} ({}, {}/{})",
+            issue.identifier,
+            issue.title,
+            issue.state.display_name(),
+            issue_index + 1,
+            issues.len()
+        )));
+
+        // Abort if there are uncommitted changes
+        if git::is_git_repo() {
+            if let Ok(true) = git::has_uncommitted_changes() {
+                let _ = event_tx.send(AppEvent::LogMessage(
+                    "Error: Uncommitted changes detected. Please commit or stash.".into(),
+                ));
+                break;
+            }
+        }
+
+        // Reset to origin/main
+        if git::is_git_repo() && !config.dry_run {
+            let _ = event_tx.send(AppEvent::LogMessage("Resetting to origin/main...".into()));
+            git::fetch("origin", "main").ok();
+            git::checkout("main")
+                .or_else(|_| git::checkout_new_from("main", "origin/main"))
+                .ok();
+            git::reset_hard("origin/main").ok();
+        }
+
+        // Resolve actual branch name from PR if available
+        let mut branch_name = issue.branch_name.clone();
+        if let (Some(pr_url), Some(gh)) = (&issue.pr_url, &github) {
+            if let Some((pr_owner, pr_repo, pr_number)) = parse_pr_url(pr_url) {
+                if let Ok(pr_branch) = gh.get_pr_head_ref(&pr_owner, &pr_repo, pr_number) {
+                    branch_name = Some(pr_branch);
+                }
+            }
+        }
+
+        // Status-based routing
+        let iteration_display = get_iteration_display(
+            state.iteration_num,
+            config.max_runs.unwrap_or(0),
+            state.extra_iterations,
+        );
+
+        let result = match &issue.state {
+            IssueStatus::Done | IssueStatus::InProgress => {
+                let _ = event_tx.send(AppEvent::LogMessage(format!(
+                    "Skipping {} -- status is '{}'",
+                    issue.identifier,
+                    issue.state.display_name()
+                )));
+                SummaryResult::Skip
+            }
+            IssueStatus::InReview => {
+                if let Some(gh) = &github {
+                    match handle_in_review_issue(
+                        config,
+                        state,
+                        issue,
+                        &branch_name,
+                        &iteration_display,
+                        gh,
+                        event_tx,
+                        cmd_rx,
+                    ) {
+                        Ok(()) => SummaryResult::Done,
+                        Err(e) => {
+                            let _ = event_tx.send(AppEvent::LogMessage(format!(
+                                "Review handling failed: {e}"
+                            )));
+                            SummaryResult::Fail
+                        }
+                    }
+                } else {
+                    let _ = event_tx.send(AppEvent::LogMessage(
+                        "Skipping review -- GitHub client not available".into(),
+                    ));
+                    SummaryResult::Skip
+                }
+            }
+            IssueStatus::Other(_) => {
+                let issue_prompt = prompt::build_issue_prompt(
+                    &issue.identifier,
+                    &issue.title,
+                    issue.description.as_deref().unwrap_or(""),
+                );
+
+                match execute_single_iteration(
+                    config,
+                    state,
+                    &issue_prompt,
+                    &branch_name,
+                    &issue.identifier,
+                    &iteration_display,
+                    event_tx,
+                    cmd_rx,
+                ) {
+                    Ok(()) => SummaryResult::Done,
+                    Err(e) => {
+                        let _ = event_tx.send(AppEvent::LogMessage(format!(
+                            "Iteration failed: {e}"
+                        )));
+                        SummaryResult::Fail
+                    }
+                }
+            }
+        };
+
+        // Update issue display status
+        let display_status = match &result {
+            SummaryResult::Done => IssueDisplayStatus::Done,
+            SummaryResult::Fail => IssueDisplayStatus::Failed,
+            SummaryResult::Skip => IssueDisplayStatus::Skipped,
+        };
+        let _ = event_tx.send(AppEvent::IssueStatusChanged {
+            index: issue_index,
+            status: display_status,
+        });
+
+        // Update counters
+        if !matches!(result, SummaryResult::Skip) {
+            state.iteration_num += 1;
+        }
+
+        state.summary_results.push(SummaryEntry {
+            identifier: issue.identifier.clone(),
+            title: issue.title.clone(),
+            result,
+            branch: branch_name.clone(),
+        });
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    Ok(())
+}
+
+/// Headless main loop (--no-tui mode). Unchanged from original logic but uses `--print`.
+pub fn headless_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationState) -> Result<()> {
     if config.max_duration.is_some() {
         state.start_time = Some(Instant::now());
     }
@@ -57,7 +268,6 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
     let issue_count = issues.len();
 
     for (issue_index, issue) in issues.iter().enumerate() {
-        // Check limits
         if let Some(max_runs) = config.max_runs {
             if max_runs != 0 && state.successful_iterations >= max_runs {
                 break;
@@ -67,9 +277,10 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
         if let Some(max_dur) = config.max_duration {
             if let Some(start) = state.start_time {
                 if start.elapsed() >= max_dur {
-                    let secs = start.elapsed().as_secs();
-                    eprintln!();
-                    eprintln!("Time limit reached ({})", crate::duration::format_duration(secs));
+                    eprintln!(
+                        "\nTime limit reached ({})",
+                        crate::duration::format_duration(start.elapsed().as_secs())
+                    );
                     break;
                 }
             }
@@ -80,9 +291,8 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
             break;
         }
 
-        // Print issue header
-        let header_line = format!(
-            "{} -- {} ({}, {}/{})",
+        eprintln!(
+            "--- {} -- {} ({}, {}/{}) ---",
             issue.identifier,
             issue.title,
             issue.state.display_name(),
@@ -90,23 +300,13 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
             issue_count
         );
 
-        let mut stdout = std::io::stderr();
-        header::set_terminal_title(&mut stdout, &header_line).ok();
-        header::set_iterm2_badge(&mut stdout, &header_line).ok();
-        eprintln!("--- {header_line} ---");
-
-        // Abort if there are uncommitted changes
         if git::is_git_repo() {
             if let Ok(true) = git::has_uncommitted_changes() {
-                eprintln!("Error: Uncommitted changes detected. Please commit or stash before continuing.");
-                if let Ok(status) = git::status_short() {
-                    eprintln!("{status}");
-                }
+                eprintln!("Error: Uncommitted changes detected.");
                 std::process::exit(1);
             }
         }
 
-        // Reset to origin/main
         if git::is_git_repo() && !config.dry_run {
             eprintln!("Resetting to origin/main...");
             git::fetch("origin", "main").ok();
@@ -116,23 +316,15 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
             git::reset_hard("origin/main").ok();
         }
 
-        // Resolve actual branch name from PR if available
         let mut branch_name = issue.branch_name.clone();
         if let (Some(pr_url), Some(gh)) = (&issue.pr_url, &github) {
             if let Some((pr_owner, pr_repo, pr_number)) = parse_pr_url(pr_url) {
                 if let Ok(pr_branch) = gh.get_pr_head_ref(&pr_owner, &pr_repo, pr_number) {
-                    if branch_name.as_ref() != Some(&pr_branch) && branch_name.is_some() {
-                        eprintln!(
-                            "PR branch '{pr_branch}' differs from Linear branch '{}', using PR branch",
-                            branch_name.as_deref().unwrap_or("")
-                        );
-                    }
                     branch_name = Some(pr_branch);
                 }
             }
         }
 
-        // Status-based routing
         let iteration_display = get_iteration_display(
             state.iteration_num,
             config.max_runs.unwrap_or(0),
@@ -141,12 +333,16 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
 
         let result = match &issue.state {
             IssueStatus::Done | IssueStatus::InProgress => {
-                eprintln!("Skipping {} -- status is '{}'", issue.identifier, issue.state.display_name());
+                eprintln!(
+                    "Skipping {} -- status is '{}'",
+                    issue.identifier,
+                    issue.state.display_name()
+                );
                 SummaryResult::Skip
             }
             IssueStatus::InReview => {
                 if let Some(gh) = &github {
-                    match handle_in_review_issue(config, state, issue, &branch_name, &iteration_display, gh) {
+                    match headless_handle_in_review(config, state, issue, &branch_name, &iteration_display, gh) {
                         Ok(()) => SummaryResult::Done,
                         Err(e) => {
                             eprintln!("Warning: Review handling failed: {e}");
@@ -165,7 +361,7 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
                     issue.description.as_deref().unwrap_or(""),
                 );
 
-                match execute_single_iteration(config, state, &issue_prompt, &branch_name, &issue.identifier, &iteration_display) {
+                match headless_execute_iteration(config, state, &issue_prompt, &branch_name, &issue.identifier, &iteration_display) {
                     Ok(()) => SummaryResult::Done,
                     Err(e) => {
                         eprintln!("Warning: Iteration failed: {e}");
@@ -175,7 +371,6 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
             }
         };
 
-        // Only increment iteration counter for non-skip results
         if !matches!(result, SummaryResult::Skip) {
             state.iteration_num += 1;
         }
@@ -187,14 +382,445 @@ pub fn main_loop(config: &Config, issues: &[LinearIssue], state: &mut IterationS
             branch: branch_name.clone(),
         });
 
-        // Brief pause between issues
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1));
     }
 
     Ok(())
 }
 
+// ---- TUI-mode iteration helpers ----
+
 fn execute_single_iteration(
+    config: &Config,
+    state: &mut IterationState,
+    issue_prompt: &str,
+    override_branch: &Option<String>,
+    identifier: &str,
+    iteration_display: &str,
+    event_tx: &mpsc::Sender<AppEvent>,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+) -> Result<()> {
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Starting iteration..."
+    )));
+
+    let main_branch = git::current_branch().unwrap_or_else(|_| "main".to_string());
+    let mut branch_name: Option<String> = None;
+
+    if config.enable_commits && !config.disable_branches {
+        match create_iteration_branch(
+            iteration_display,
+            state.iteration_num,
+            override_branch,
+            &config.git_branch_prefix,
+            config.dry_run,
+        ) {
+            Ok(name) => {
+                if let Some(ref b) = name {
+                    let _ = event_tx.send(AppEvent::BranchChanged(Some(b.clone())));
+                }
+                branch_name = name;
+            }
+            Err(e) => {
+                if git::is_git_repo() {
+                    let _ = event_tx.send(AppEvent::LogMessage(format!(
+                        "{iteration_display} Failed to create branch: {e}"
+                    )));
+                    state.error_count += 1;
+                    state.extra_iterations += 1;
+                    if state.error_count >= 3 {
+                        anyhow::bail!("Fatal: 3 consecutive errors occurred.");
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&config.notes_dir).ok();
+    let notes_file = prompt::notes_file_path(&config.notes_dir, identifier);
+    let notes_exist = std::path::Path::new(&notes_file).exists();
+
+    let enhanced_prompt = prompt::build_iteration_prompt(
+        issue_prompt,
+        &config.completion_signal,
+        &notes_file,
+        notes_exist,
+        config.review_prompt.as_deref(),
+    );
+
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Launching Claude Code..."
+    )));
+
+    let exit_code = run_claude_with_events(
+        &enhanced_prompt,
+        &config.allowed_tools,
+        &config.extra_claude_flags,
+        config.dry_run,
+        event_tx,
+        cmd_rx,
+    )?;
+
+    if exit_code != 0 {
+        let _ = event_tx.send(AppEvent::LogMessage(format!(
+            "Claude Code exited with code: {exit_code}"
+        )));
+        if let Some(ref branch) = branch_name {
+            if git::is_git_repo() {
+                git::checkout(&main_branch).ok();
+                git::delete_branch(branch).ok();
+            }
+        }
+        state.error_count += 1;
+        state.extra_iterations += 1;
+        if state.error_count >= 3 {
+            anyhow::bail!("Fatal: 3 consecutive errors occurred.");
+        }
+        return Err(anyhow::anyhow!("Claude exited with code {exit_code}"));
+    }
+
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Claude session completed"
+    )));
+
+    if config.enable_commits {
+        verify_commit_and_push(config, state, iteration_display, &branch_name, &main_branch, &notes_file, event_tx)?;
+    } else {
+        let _ = event_tx.send(AppEvent::LogMessage(format!(
+            "{iteration_display} Skipping commit verification (--disable-commits)"
+        )));
+        if let Some(ref branch) = branch_name {
+            if git::is_git_repo() {
+                git::checkout(&main_branch).ok();
+                git::delete_branch(branch).ok();
+            }
+        }
+    }
+
+    state.error_count = 0;
+    if state.extra_iterations > 0 {
+        state.extra_iterations -= 1;
+    }
+    state.successful_iterations += 1;
+    Ok(())
+}
+
+/// Spawn claude --print, forward output lines as AppEvent::ClaudeOutput,
+/// check for skip/quit commands, and return exit code.
+fn run_claude_with_events(
+    prompt: &str,
+    allowed_tools: &str,
+    extra_flags: &[String],
+    dry_run: bool,
+    event_tx: &mpsc::Sender<AppEvent>,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+) -> Result<i32> {
+    if dry_run {
+        let _ = event_tx.send(AppEvent::ClaudeOutput("(DRY RUN) Would run Claude".into()));
+        let _ = event_tx.send(AppEvent::ClaudeFinished(0));
+        return Ok(0);
+    }
+
+    let mut proc = claude_runner::spawn_claude_print(prompt, allowed_tools, extra_flags)?;
+
+    loop {
+        // Check for worker commands (non-blocking)
+        match cmd_rx.try_recv() {
+            Ok(WorkerCommand::SkipCurrent) | Ok(WorkerCommand::Quit) => {
+                // Kill the child process
+                let _ = proc.child.kill();
+                let _ = proc.child.wait();
+                let _ = event_tx.send(AppEvent::ClaudeFinished(-1));
+                return Ok(-1);
+            }
+            Err(_) => {}
+        }
+
+        // Drain available output lines (non-blocking)
+        let mut got_line = false;
+        loop {
+            match proc.line_rx.try_recv() {
+                Ok(line) => {
+                    got_line = true;
+                    let _ = event_tx.send(AppEvent::ClaudeOutput(line));
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Check if child has exited
+        match proc.child.try_wait() {
+            Ok(Some(status)) => {
+                // Drain remaining lines
+                for line in proc.line_rx.try_iter() {
+                    let _ = event_tx.send(AppEvent::ClaudeOutput(line));
+                }
+                let code = status.code().unwrap_or(1);
+                let _ = event_tx.send(AppEvent::ClaudeFinished(code));
+                return Ok(code);
+            }
+            Ok(None) => {
+                // Still running
+                if !got_line {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err(e) => {
+                let _ = event_tx.send(AppEvent::ClaudeFinished(1));
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+fn handle_in_review_issue(
+    config: &Config,
+    _state: &mut IterationState,
+    issue: &LinearIssue,
+    branch_name: &Option<String>,
+    iteration_display: &str,
+    github: &GitHubClient,
+    event_tx: &mpsc::Sender<AppEvent>,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+) -> Result<()> {
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Handling review for {} ...",
+        issue.identifier
+    )));
+
+    let branch = branch_name
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No branch name for issue {}", issue.identifier))?;
+
+    let pr_url = issue
+        .pr_url
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No PR found for issue {}", issue.identifier))?;
+
+    let (pr_owner, pr_repo, pr_number) =
+        parse_pr_url(pr_url).ok_or_else(|| anyhow::anyhow!("Could not parse PR URL: {pr_url}"))?;
+
+    let _ = event_tx.send(AppEvent::BranchChanged(Some(branch.clone())));
+
+    let ci_failures = fetch_ci_failures(github, &pr_owner, &pr_repo, pr_number)?;
+
+    let inline_comments = github
+        .get_pr_review_comments(&pr_owner, &pr_repo, pr_number)
+        .unwrap_or_default();
+    let reviews = github
+        .get_pr_reviews(&pr_owner, &pr_repo, pr_number)
+        .unwrap_or_default();
+    let conversation = github
+        .get_issue_comments(&pr_owner, &pr_repo, pr_number)
+        .unwrap_or_default();
+
+    let has_ci = ci_failures.is_some();
+    let has_comments = !inline_comments.is_empty() || !reviews.is_empty() || !conversation.is_empty();
+
+    if !has_ci && !has_comments {
+        let _ = event_tx.send(AppEvent::LogMessage(
+            "No review comments or CI failures, nothing to do".into(),
+        ));
+        return Ok(());
+    }
+
+    let inline_json = serde_json::to_string_pretty(&inline_comments).unwrap_or_default();
+    let review_json = serde_json::to_string_pretty(&reviews).unwrap_or_default();
+    let convo_json = serde_json::to_string_pretty(&conversation).unwrap_or_default();
+
+    let review_prompt = prompt::build_review_prompt(
+        &issue.identifier,
+        &issue.title,
+        pr_number,
+        &pr_owner,
+        &pr_repo,
+        branch,
+        ci_failures.as_deref(),
+        &inline_json,
+        &review_json,
+        &convo_json,
+    );
+
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Checking out PR branch: {branch}"
+    )));
+    git::fetch("origin", branch)?;
+    git::checkout(branch)
+        .or_else(|_| git::checkout_new_from(branch, &format!("origin/{branch}")))?;
+    git::reset_hard(&format!("origin/{branch}")).ok();
+
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Launching Claude Code to resolve review..."
+    )));
+
+    let exit_code = run_claude_with_events(
+        &review_prompt,
+        &config.allowed_tools,
+        &config.extra_claude_flags,
+        config.dry_run,
+        event_tx,
+        cmd_rx,
+    )?;
+
+    if exit_code != 0 {
+        git::checkout("main").ok();
+        return Err(anyhow::anyhow!("Claude exited with code {exit_code}"));
+    }
+
+    let local_sha = git::rev_parse("HEAD")?;
+    let remote_sha = git::ls_remote_head(branch)?.unwrap_or_default();
+
+    if local_sha != remote_sha {
+        let _ = event_tx.send(AppEvent::LogMessage("Pushing review fixes...".into()));
+        git::push("origin", branch).ok();
+    }
+
+    git::checkout("main").ok();
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Review comments addressed for {}",
+        issue.identifier
+    )));
+    Ok(())
+}
+
+fn verify_commit_and_push(
+    config: &Config,
+    state: &mut IterationState,
+    iteration_display: &str,
+    branch_name: &Option<String>,
+    main_branch: &str,
+    notes_file: &str,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<()> {
+    if !git::is_git_repo() {
+        return Ok(());
+    }
+
+    let has_uncommitted = git::has_uncommitted_changes()?;
+    if has_uncommitted {
+        let _ = event_tx.send(AppEvent::LogMessage(format!(
+            "{iteration_display} Uncommitted changes detected after Claude session"
+        )));
+    }
+
+    let has_commits = if let Some(ref branch) = branch_name {
+        git::commit_count_since(main_branch, branch).unwrap_or(0) > 0
+    } else {
+        false
+    };
+
+    if !has_commits && !has_uncommitted {
+        let _ = event_tx.send(AppEvent::LogMessage(format!(
+            "{iteration_display} No changes detected, cleaning up branch..."
+        )));
+        if let Some(ref branch) = branch_name {
+            git::checkout(main_branch).ok();
+            git::delete_branch(branch).ok();
+        }
+        return Ok(());
+    }
+
+    if config.dry_run {
+        return Ok(());
+    }
+
+    if let Some(ref branch) = branch_name {
+        if has_commits {
+            if !git::branch_exists_remote(branch)? {
+                let _ = event_tx.send(AppEvent::LogMessage(format!(
+                    "{iteration_display} Pushing branch..."
+                )));
+                if git::push_branch(branch).is_err() {
+                    state.unpushed_branches.push(branch.clone());
+                } else {
+                    let _ = event_tx.send(AppEvent::LogMessage(format!(
+                        "{iteration_display} Pushed branch: {branch}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if config.open_pr {
+        if let Some(ref branch) = branch_name {
+            if !state.unpushed_branches.contains(branch) {
+                create_pr_if_needed(config, state, iteration_display, branch, main_branch, notes_file, event_tx)?;
+            }
+        }
+    }
+
+    if branch_name.is_some() {
+        git::checkout(main_branch)?;
+    }
+
+    Ok(())
+}
+
+fn create_pr_if_needed(
+    config: &Config,
+    _state: &mut IterationState,
+    iteration_display: &str,
+    branch: &str,
+    base: &str,
+    notes_file: &str,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<()> {
+    let gh = GitHubClient::new()?;
+
+    if let Some(pr_num) = gh.find_pr_for_branch(&config.github_owner, &config.github_repo, branch)? {
+        let _ = event_tx.send(AppEvent::LogMessage(format!(
+            "{iteration_display} PR #{pr_num} already exists for {branch}"
+        )));
+        return Ok(());
+    }
+
+    let _ = event_tx.send(AppEvent::LogMessage(format!(
+        "{iteration_display} Creating pull request..."
+    )));
+
+    let commit_message = git::log_last_message(branch)?;
+    let mut lines = commit_message.lines();
+    let title = lines.next().unwrap_or("").to_string();
+    let body: String = lines.skip(1).collect::<Vec<&str>>().join("\n");
+
+    match gh.create_pr(
+        &config.github_owner,
+        &config.github_repo,
+        &title,
+        &body,
+        branch,
+        base,
+        true,
+    ) {
+        Ok(pr_number) => {
+            let _ = event_tx.send(AppEvent::LogMessage(format!(
+                "{iteration_display} PR #{pr_number} created: {title}"
+            )));
+
+            if std::path::Path::new(notes_file).exists() {
+                if let Ok(notes) = std::fs::read_to_string(notes_file) {
+                    if !notes.is_empty() {
+                        let comment = format!("## Claude's Notes\n\n{notes}");
+                        gh.post_comment(&config.github_owner, &config.github_repo, pr_number, &comment).ok();
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(AppEvent::LogMessage(format!(
+                "{iteration_display} Failed to create PR: {e}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// ---- Headless mode helpers ----
+
+fn headless_execute_iteration(
     config: &Config,
     state: &mut IterationState,
     issue_prompt: &str,
@@ -236,21 +862,16 @@ fn execute_single_iteration(
         config.review_prompt.as_deref(),
     );
 
-    eprintln!("{iteration_display} Launching Claude Code interactively...");
+    eprintln!("{iteration_display} Launching Claude Code (print mode)...");
 
-    let header_line = std::env::var("LC_ISSUE_HEADER_LINE").ok();
-    let header_text = header_line.as_deref();
-
-    let exit_code = claude::run_claude_interactive(
+    let exit_code = claude::run_claude_print(
         &enhanced_prompt,
         &config.allowed_tools,
         &config.extra_claude_flags,
-        header_text,
         config.dry_run,
     )?;
 
     if exit_code != 0 {
-        eprintln!();
         eprintln!("Warning: Claude Code exited with code: {exit_code}");
         if let Some(ref branch) = branch_name {
             if git::is_git_repo() {
@@ -269,9 +890,8 @@ fn execute_single_iteration(
     eprintln!("{iteration_display} Claude session completed");
 
     if config.enable_commits {
-        verify_commit_and_push(config, state, iteration_display, &branch_name, &main_branch, &notes_file)?;
+        headless_verify_commit_and_push(config, state, iteration_display, &branch_name, &main_branch, &notes_file)?;
     } else {
-        eprintln!("{iteration_display} Skipping commit verification (--disable-commits flag set)");
         if let Some(ref branch) = branch_name {
             if git::is_git_repo() {
                 git::checkout(&main_branch).ok();
@@ -288,55 +908,7 @@ fn execute_single_iteration(
     Ok(())
 }
 
-fn create_iteration_branch(
-    iteration_display: &str,
-    iteration_num: u32,
-    override_branch: &Option<String>,
-    prefix: &str,
-    dry_run: bool,
-) -> Result<Option<String>> {
-    if !git::is_git_repo() {
-        return Ok(None);
-    }
-
-    let current = git::current_branch()?;
-    if current.starts_with(prefix) {
-        eprintln!("{iteration_display} Already on iteration branch: {current}");
-        git::checkout("main")?;
-    }
-
-    let branch_name = if let Some(name) = override_branch {
-        name.clone()
-    } else {
-        let date = chrono_free_date();
-        let hash = random_hex(8);
-        format!("{prefix}iteration-{iteration_num}/{date}-{hash}")
-    };
-
-    eprintln!("{iteration_display} Creating/checking out branch: {branch_name}");
-
-    if dry_run {
-        eprintln!("   (DRY RUN) Would create branch {branch_name}");
-        return Ok(Some(branch_name));
-    }
-
-    // Check remote first
-    if git::branch_exists_remote(&branch_name)? {
-        eprintln!("{iteration_display} Branch exists remotely, fetching and checking out...");
-        git::fetch("origin", &branch_name)?;
-        git::checkout(&branch_name)
-            .or_else(|_| git::checkout_new_from(&branch_name, &format!("origin/{branch_name}")))?;
-    } else if git::branch_exists_local(&branch_name)? {
-        eprintln!("{iteration_display} Branch exists locally, checking out...");
-        git::checkout(&branch_name)?;
-    } else {
-        git::checkout_new(&branch_name)?;
-    }
-
-    Ok(Some(branch_name))
-}
-
-fn verify_commit_and_push(
+fn headless_verify_commit_and_push(
     config: &Config,
     state: &mut IterationState,
     iteration_display: &str,
@@ -349,13 +921,6 @@ fn verify_commit_and_push(
     }
 
     let has_uncommitted = git::has_uncommitted_changes()?;
-    if has_uncommitted {
-        eprintln!("{iteration_display} Uncommitted changes detected after Claude session");
-        if let Ok(status) = git::status_short() {
-            eprintln!("{status}");
-        }
-    }
-
     let has_commits = if let Some(ref branch) = branch_name {
         git::commit_count_since(main_branch, branch).unwrap_or(0) > 0
     } else {
@@ -372,37 +937,26 @@ fn verify_commit_and_push(
     }
 
     if config.dry_run {
-        eprintln!("{iteration_display} (DRY RUN) Would verify push...");
         return Ok(());
     }
 
-    // Push if needed
     if let Some(ref branch) = branch_name {
-        if has_commits {
-            if !git::branch_exists_remote(branch)? {
-                eprintln!("{iteration_display} Branch not pushed, pushing now...");
-                if git::push_branch(branch).is_err() {
-                    eprintln!("{iteration_display} Failed to push branch -- will retry manually");
-                    state.unpushed_branches.push(branch.clone());
-                } else {
-                    eprintln!("{iteration_display} Pushed branch: {branch}");
-                }
-            } else {
-                eprintln!("{iteration_display} Branch already pushed: {branch}");
+        if has_commits && !git::branch_exists_remote(branch)? {
+            eprintln!("{iteration_display} Pushing branch...");
+            if git::push_branch(branch).is_err() {
+                state.unpushed_branches.push(branch.clone());
             }
         }
     }
 
-    // Create PR if requested
     if config.open_pr {
         if let Some(ref branch) = branch_name {
             if !state.unpushed_branches.contains(branch) {
-                create_pr_if_needed(config, state, iteration_display, branch, main_branch, notes_file)?;
+                headless_create_pr(config, state, iteration_display, branch, main_branch, notes_file)?;
             }
         }
     }
 
-    // Return to main branch
     if branch_name.is_some() {
         git::checkout(main_branch)?;
     }
@@ -410,7 +964,7 @@ fn verify_commit_and_push(
     Ok(())
 }
 
-fn create_pr_if_needed(
+fn headless_create_pr(
     config: &Config,
     _state: &mut IterationState,
     iteration_display: &str,
@@ -419,56 +973,36 @@ fn create_pr_if_needed(
     notes_file: &str,
 ) -> Result<()> {
     let gh = GitHubClient::new()?;
-
-    // Check if PR already exists
     if let Some(pr_num) = gh.find_pr_for_branch(&config.github_owner, &config.github_repo, branch)? {
         eprintln!("{iteration_display} PR #{pr_num} already exists for {branch}");
         return Ok(());
     }
 
     eprintln!("{iteration_display} Creating pull request...");
-
     let commit_message = git::log_last_message(branch)?;
     let mut lines = commit_message.lines();
     let title = lines.next().unwrap_or("").to_string();
     let body: String = lines.skip(1).collect::<Vec<&str>>().join("\n");
 
-    match gh.create_pr(
-        &config.github_owner,
-        &config.github_repo,
-        &title,
-        &body,
-        branch,
-        base,
-        true,
-    ) {
+    match gh.create_pr(&config.github_owner, &config.github_repo, &title, &body, branch, base, true) {
         Ok(pr_number) => {
             eprintln!("{iteration_display} PR #{pr_number} created: {title}");
-
-            // Post notes as PR comment
             if std::path::Path::new(notes_file).exists() {
                 if let Ok(notes) = std::fs::read_to_string(notes_file) {
                     if !notes.is_empty() {
                         let comment = format!("## Claude's Notes\n\n{notes}");
-                        if gh
-                            .post_comment(&config.github_owner, &config.github_repo, pr_number, &comment)
-                            .is_ok()
-                        {
-                            eprintln!("{iteration_display} Posted notes as PR comment");
-                        }
+                        gh.post_comment(&config.github_owner, &config.github_repo, pr_number, &comment).ok();
                     }
                 }
             }
         }
-        Err(e) => {
-            eprintln!("{iteration_display} Failed to create PR: {e}");
-        }
+        Err(e) => eprintln!("{iteration_display} Failed to create PR: {e}"),
     }
 
     Ok(())
 }
 
-fn handle_in_review_issue(
+fn headless_handle_in_review(
     config: &Config,
     _state: &mut IterationState,
     issue: &LinearIssue,
@@ -476,8 +1010,6 @@ fn handle_in_review_issue(
     iteration_display: &str,
     github: &GitHubClient,
 ) -> Result<()> {
-    eprintln!("{iteration_display} Handling review for {} ...", issue.identifier);
-
     let branch = branch_name
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No branch name for issue {}", issue.identifier))?;
@@ -490,22 +1022,11 @@ fn handle_in_review_issue(
     let (pr_owner, pr_repo, pr_number) =
         parse_pr_url(pr_url).ok_or_else(|| anyhow::anyhow!("Could not parse PR URL: {pr_url}"))?;
 
-    eprintln!("{iteration_display} Found PR #{pr_number} ({pr_owner}/{pr_repo}) for branch {branch}");
-
-    // Fetch CI failures
-    eprintln!("{iteration_display} Checking CI status for PR #{pr_number}...");
     let ci_failures = fetch_ci_failures(github, &pr_owner, &pr_repo, pr_number)?;
 
-    // Fetch review comments
-    let inline_comments = github
-        .get_pr_review_comments(&pr_owner, &pr_repo, pr_number)
-        .unwrap_or_default();
-    let reviews = github
-        .get_pr_reviews(&pr_owner, &pr_repo, pr_number)
-        .unwrap_or_default();
-    let conversation = github
-        .get_issue_comments(&pr_owner, &pr_repo, pr_number)
-        .unwrap_or_default();
+    let inline_comments = github.get_pr_review_comments(&pr_owner, &pr_repo, pr_number).unwrap_or_default();
+    let reviews = github.get_pr_reviews(&pr_owner, &pr_repo, pr_number).unwrap_or_default();
+    let conversation = github.get_issue_comments(&pr_owner, &pr_repo, pr_number).unwrap_or_default();
 
     let has_ci = ci_failures.is_some();
     let has_comments = !inline_comments.is_empty() || !reviews.is_empty() || !conversation.is_empty();
@@ -520,61 +1041,86 @@ fn handle_in_review_issue(
     let convo_json = serde_json::to_string_pretty(&conversation).unwrap_or_default();
 
     let review_prompt = prompt::build_review_prompt(
-        &issue.identifier,
-        &issue.title,
-        pr_number,
-        &pr_owner,
-        &pr_repo,
-        branch,
-        ci_failures.as_deref(),
-        &inline_json,
-        &review_json,
-        &convo_json,
+        &issue.identifier, &issue.title, pr_number, &pr_owner, &pr_repo, branch,
+        ci_failures.as_deref(), &inline_json, &review_json, &convo_json,
     );
 
-    // Checkout PR branch
-    eprintln!("{iteration_display} Checking out PR branch: {branch}");
     git::fetch("origin", branch)?;
     git::checkout(branch)
         .or_else(|_| git::checkout_new_from(branch, &format!("origin/{branch}")))?;
     git::reset_hard(&format!("origin/{branch}")).ok();
 
-    eprintln!("{iteration_display} Launching Claude Code to resolve review comments...");
+    eprintln!("{iteration_display} Launching Claude Code to resolve review...");
 
-    let header_line = format!(
-        "{} -- {} (In Review, PR #{})",
-        issue.identifier, issue.title, pr_number
-    );
-
-    let exit_code = claude::run_claude_interactive(
+    let exit_code = claude::run_claude_print(
         &review_prompt,
         &config.allowed_tools,
         &config.extra_claude_flags,
-        Some(&header_line),
         config.dry_run,
     )?;
 
     if exit_code != 0 {
-        eprintln!("{iteration_display} Claude Code failed for review resolution");
         git::checkout("main").ok();
         return Err(anyhow::anyhow!("Claude exited with code {exit_code}"));
     }
 
-    // Verify push
-    eprintln!("{iteration_display} Verifying push for review fixes...");
     let local_sha = git::rev_parse("HEAD")?;
     let remote_sha = git::ls_remote_head(branch)?.unwrap_or_default();
 
     if local_sha != remote_sha {
         eprintln!("{iteration_display} Pushing review fixes...");
         git::push("origin", branch).ok();
-    } else {
-        eprintln!("{iteration_display} Review fixes already pushed");
     }
 
     git::checkout("main").ok();
-    eprintln!("{iteration_display} Review comments addressed for {}", issue.identifier);
     Ok(())
+}
+
+// ---- Shared helpers ----
+
+fn check_quit(cmd_rx: &mpsc::Receiver<WorkerCommand>) -> bool {
+    matches!(cmd_rx.try_recv(), Ok(WorkerCommand::Quit))
+}
+
+fn create_iteration_branch(
+    _iteration_display: &str,
+    iteration_num: u32,
+    override_branch: &Option<String>,
+    prefix: &str,
+    dry_run: bool,
+) -> Result<Option<String>> {
+    if !git::is_git_repo() {
+        return Ok(None);
+    }
+
+    let current = git::current_branch()?;
+    if current.starts_with(prefix) {
+        git::checkout("main")?;
+    }
+
+    let branch_name = if let Some(name) = override_branch {
+        name.clone()
+    } else {
+        let date = chrono_free_date();
+        let hash = random_hex(8);
+        format!("{prefix}iteration-{iteration_num}/{date}-{hash}")
+    };
+
+    if dry_run {
+        return Ok(Some(branch_name));
+    }
+
+    if git::branch_exists_remote(&branch_name)? {
+        git::fetch("origin", &branch_name)?;
+        git::checkout(&branch_name)
+            .or_else(|_| git::checkout_new_from(&branch_name, &format!("origin/{branch_name}")))?;
+    } else if git::branch_exists_local(&branch_name)? {
+        git::checkout(&branch_name)?;
+    } else {
+        git::checkout_new(&branch_name)?;
+    }
+
+    Ok(Some(branch_name))
 }
 
 fn fetch_ci_failures(
@@ -588,13 +1134,11 @@ fn fetch_ci_failures(
     let failed_checks = github.get_failed_checks(owner, repo, &head_sha)?;
 
     if failed_checks.is_empty() {
-        // Check legacy status API
         let failed_statuses = github.get_failed_statuses(owner, repo, &head_sha)?;
         if failed_statuses.is_empty() {
             return Ok(None);
         }
 
-        eprintln!("Found {} failing CI status(es)", failed_statuses.len());
         let mut context = "### Failing CI Statuses\n".to_string();
         for s in &failed_statuses {
             context.push_str(&format!(
@@ -607,29 +1151,25 @@ fn fetch_ci_failures(
         return Ok(Some(context));
     }
 
-    eprintln!("Found {} failing CI check(s)", failed_checks.len());
-    for c in &failed_checks {
-        eprintln!("  - {}: {}", c.name, c.conclusion.as_deref().unwrap_or("?"));
-    }
-
     let mut ci_context = "### Failing CI Checks\n".to_string();
 
     for check in &failed_checks {
         ci_context.push_str(&format!("\n#### Check: {}\n", check.name));
 
-        // Fetch annotations
         if let Ok(annotations) = github.get_check_annotations(owner, repo, check.id) {
             if !annotations.is_empty() {
                 ci_context.push_str("Annotations:\n```\n");
                 for ann in &annotations {
-                    let line = format!("[{}] {}:{} -- {}\n", ann.annotation_level, ann.path, ann.start_line, ann.message);
+                    let line = format!(
+                        "[{}] {}:{} -- {}\n",
+                        ann.annotation_level, ann.path, ann.start_line, ann.message
+                    );
                     ci_context.push_str(&line[..line.len().min(3000)]);
                 }
                 ci_context.push_str("```\n");
             }
         }
 
-        // Fetch failed job logs
         if let Ok(run_ids) = github.get_failed_workflow_runs(owner, repo, &head_sha) {
             for run_id in run_ids.iter().take(3) {
                 if let Ok(jobs) = github.get_failed_jobs(owner, repo, *run_id) {
@@ -669,7 +1209,6 @@ fn get_iteration_display(iteration_num: u32, max_runs: u32, extra_iters: u32) ->
 }
 
 fn chrono_free_date() -> String {
-    // Use `date` command to avoid adding chrono dependency
     std::process::Command::new("date")
         .arg("+%Y-%m-%d")
         .output()
@@ -685,7 +1224,6 @@ fn random_hex(len: usize) -> String {
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         f.read_exact(&mut buf).ok();
     } else {
-        // Fallback: use process ID and time
         let seed = std::process::id() as u64 ^ now_epoch_secs();
         buf = seed.to_le_bytes().to_vec();
     }

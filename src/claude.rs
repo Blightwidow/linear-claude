@@ -1,37 +1,38 @@
-use crate::pty;
 use anyhow::Result;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
-/// Run Claude Code interactively. If `header_text` is provided, use PTY wrapper for persistent header.
-/// Returns the exit code from Claude.
-pub fn run_claude_interactive(
+/// Run Claude in non-interactive `--print` mode, feeding prompt via stdin.
+/// Used for --no-tui / headless mode.
+pub fn run_claude_print(
     prompt: &str,
     allowed_tools: &str,
     extra_flags: &[String],
-    header_text: Option<&str>,
     dry_run: bool,
 ) -> Result<i32> {
     if dry_run {
-        eprintln!("(DRY RUN) Would run Claude interactively");
+        eprintln!("(DRY RUN) Would run Claude in print mode");
         return Ok(0);
     }
 
-    let mut argv = vec![
-        "claude".to_string(),
-        prompt.to_string(),
-        "--allowedTools".to_string(),
-        allowed_tools.to_string(),
-    ];
-    argv.extend(extra_flags.iter().cloned());
+    let mut cmd = Command::new("claude");
+    cmd.arg("--print")
+        .arg("--allowedTools")
+        .arg(allowed_tools);
 
-    if let Some(header) = header_text {
-        // Use PTY wrapper with header
-        pty::relay::run_with_header(header, &argv)
-    } else {
-        // Run claude directly without PTY wrapper
-        let status = Command::new(&argv[0])
-            .args(&argv[1..])
-            .status()?;
-        Ok(status.code().unwrap_or(1))
+    for flag in extra_flags {
+        cmd.arg(flag);
     }
+
+    cmd.stdin(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes())?;
+        // stdin dropped here, closing the pipe
+    }
+
+    let status = child.wait()?;
+    Ok(status.code().unwrap_or(1))
 }

@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LinearIssue {
     pub id: String,
     pub identifier: String,
@@ -101,6 +102,7 @@ pub struct AttachmentConnection {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct RawAttachment {
     pub url: Option<String>,
     pub title: Option<String>,

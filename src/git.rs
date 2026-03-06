@@ -143,10 +143,6 @@ pub fn ls_remote_head(branch: &str) -> Result<Option<String>> {
     Ok(sha)
 }
 
-pub fn status_short() -> Result<String> {
-    run_git(&["status", "--short"])
-}
-
 pub fn log_last_message(branch: &str) -> Result<String> {
     run_git(&["log", "-1", "--format=%B", branch])
 }

@@ -17,11 +17,13 @@ pub struct Config {
     pub notes_dir: PathBuf,
     pub dry_run: bool,
     pub completion_signal: String,
+    #[allow(dead_code)]
     pub completion_threshold: u32,
     pub review_prompt: Option<String>,
     pub open_pr: bool,
     pub allowed_tools: String,
     pub extra_claude_flags: Vec<String>,
+    pub no_tui: bool,
 }
 
 impl Config {
@@ -96,6 +98,7 @@ impl Config {
             open_pr: args.open_pr,
             allowed_tools: args.allowed_tools,
             extra_claude_flags: args.extra_claude_flags,
+            no_tui: args.no_tui,
         })
     }
 }

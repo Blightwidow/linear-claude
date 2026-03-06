@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct PullRequest {
     pub number: u64,
     pub head: PrHead,
@@ -41,6 +42,7 @@ pub struct CommitStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CommitStatus {
     pub context: String,
     pub state: String,
@@ -54,6 +56,7 @@ pub struct WorkflowRunsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct WorkflowRun {
     pub id: u64,
     pub head_sha: String,

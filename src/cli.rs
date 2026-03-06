@@ -100,6 +100,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub open_pr: bool,
 
+    /// Disable TUI and use simple text output (for CI/headless)
+    #[arg(long)]
+    pub no_tui: bool,
+
     /// Extra flags forwarded to claude CLI
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub extra_claude_flags: Vec<String>,
