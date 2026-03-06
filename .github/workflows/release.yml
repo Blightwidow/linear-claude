@@ -33,28 +33,57 @@ jobs:
           echo "SHA256 checksum:"
           cat linear_claude.sh.sha256
 
-      - name: Generate changelog
+      - name: Generate changelog from commits
         run: |
           PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.' | sed -n '2p')
           if [ -n "$PREV_TAG" ]; then
-            echo "## Changes since $PREV_TAG" > changelog.md
-            echo "" >> changelog.md
-            git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+            git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges > commit_list.txt
+            echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
           else
-            echo "## Initial Release" > changelog.md
-            echo "" >> changelog.md
-            git log --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+            git log --pretty=format:"- %s (%h)" --no-merges > commit_list.txt
           fi
-          echo ""
-          echo "--- Changelog ---"
-          cat changelog.md
+
+      - name: Update CHANGELOG.md
+        run: |
+          {
+            echo "## $VERSION"
+            echo ""
+            cat commit_list.txt
+            echo ""
+          } > new_entry.md
+
+          if [ -f CHANGELOG.md ]; then
+            { head -1 CHANGELOG.md; echo ""; cat new_entry.md; echo ""; tail -n +3 CHANGELOG.md; } > CHANGELOG.md.tmp
+            mv CHANGELOG.md.tmp CHANGELOG.md
+          else
+            { echo "# Changelog"; echo ""; cat new_entry.md; } > CHANGELOG.md
+          fi
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          {
+            if [ -n "$PREV_TAG" ]; then
+              echo "## Changes since $PREV_TAG"
+            else
+              echo "## Initial Release"
+            fi
+            echo ""
+            cat commit_list.txt
+          } > release_notes.md
+
           gh release create "$VERSION" \
             --title "$VERSION" \
-            --notes-file changelog.md \
+            --notes-file release_notes.md \
             linear_claude.sh \
             linear_claude.sh.sha256
+
+      - name: Commit changelog and checksum to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git add CHANGELOG.md linear_claude.sh.sha256
+          git commit -m "release: update changelog and checksum for $VERSION"
+          git push origin main

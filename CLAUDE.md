@@ -127,11 +127,10 @@ TESTING=1 source ./linear_claude.sh
 ## Releasing
 
 1. Bump `LC_VERSION` in `linear_claude.sh`
-2. Update `CHANGELOG.md` with the new version's changes
-3. Commit: `git commit -m "Bump vX.Y.Z"`
-4. Tag: `git tag vX.Y.Z`
-5. Push: `git push && git push --tags`
-6. GitHub Actions (`.github/workflows/release.yml`) automatically creates the release with the script and its SHA256 checksum
+2. Commit: `git commit -m "Bump vX.Y.Z"`
+3. Tag: `git tag vX.Y.Z`
+4. Push: `git push && git push --tags`
+5. GitHub Actions (`.github/workflows/release.yml`) automatically creates the release, then commits the updated `CHANGELOG.md` and `linear_claude.sh.sha256` back to main
 
 ## Conventions
 
