@@ -72,6 +72,7 @@ pub fn build_iteration_prompt(
 }
 
 /// Build the prompt for handling an in-review issue (CI failures + review comments).
+#[allow(clippy::too_many_arguments)]
 pub fn build_review_prompt(
     identifier: &str,
     title: &str,

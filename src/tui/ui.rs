@@ -3,9 +3,10 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
+use tui_term::widget::PseudoTerminal;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [main_area, footer] = Layout::vertical([
@@ -26,15 +27,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(left);
 
+    // Track panel dimensions for parser resize on next reset
+    let inner_rows = right.height.saturating_sub(2);
+    let inner_cols = right.width.saturating_sub(2);
+    app.update_panel_size(inner_rows, inner_cols);
+
     // Issue list
     draw_issue_list(frame, app, issue_list_area);
 
     // Stats panel
     draw_stats(frame, app, stats_area);
 
-    // Claude output panel
-    let output_height = right.height.saturating_sub(2); // borders
-    draw_output(frame, app, right, output_height);
+    // Claude terminal panel
+    let screen = app.parser.screen();
+    let pseudo_term = PseudoTerminal::new(screen).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Claude "),
+    );
+    frame.render_widget(pseudo_term, right);
 
     // Footer
     draw_footer(frame, footer);
@@ -105,53 +116,13 @@ fn draw_stats(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(para, area);
 }
 
-fn draw_output(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect, visible_height: u16) {
-    let total_lines = app.output_lines.len() as u16;
-
-    // Auto-scroll: keep scroll at bottom
-    if app.auto_scroll {
-        app.scroll_offset = total_lines.saturating_sub(visible_height);
-    }
-
-    let para = Paragraph::new(
-        app.output_lines
-            .iter()
-            .map(|l| Line::raw(l.as_str()))
-            .collect::<Vec<_>>(),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Claude Output "),
-    )
-    .wrap(Wrap { trim: false })
-    .scroll((app.scroll_offset, 0));
-
-    frame.render_widget(para, area);
-}
-
 fn draw_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(": quit  "),
         Span::styled("s", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(": skip  "),
-        Span::styled("↑/↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(": scroll  "),
-        Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(": page  "),
-        Span::styled("End", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(": follow  "),
-        Span::styled("Home", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(": top"),
+        Span::raw(": skip"),
     ]));
 
     frame.render_widget(footer, area);
-}
-
-/// Returns the visible height of the output panel (for scroll calculations).
-pub fn output_visible_height(terminal_height: u16) -> u16 {
-    // main area = terminal_height - 1 (footer)
-    // right panel has borders = -2
-    terminal_height.saturating_sub(1).saturating_sub(2)
 }

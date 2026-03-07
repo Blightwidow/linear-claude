@@ -76,6 +76,7 @@ impl GitHubClient {
     }
 
     /// Create a new pull request. Returns the PR number.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_pr(
         &self,
         owner: &str,

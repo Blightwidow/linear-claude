@@ -1,64 +1,65 @@
 use anyhow::Result;
-use std::io::{BufRead, Write as IoWrite};
-use std::process::{Child, Command, Stdio};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::sync::mpsc;
 use std::thread;
 
 pub struct ClaudeProcess {
-    pub child: Child,
-    pub line_rx: mpsc::Receiver<String>,
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub byte_rx: mpsc::Receiver<Vec<u8>>,
+    /// Send bytes here to write to Claude's stdin
+    pub input_tx: mpsc::Sender<Vec<u8>>,
+    /// Keep master alive so the PTY stays open
+    _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-/// Spawn `claude --print --output-format stream-json`, feed prompt via stdin.
-/// Parses streamed JSON lines and sends displayable text via channel.
-pub fn spawn_claude_print(
+/// Spawn Claude in a PTY. Returns a ClaudeProcess with byte channels
+/// for raw terminal I/O and the child handle.
+pub fn spawn_claude(
     prompt: &str,
     allowed_tools: &str,
     extra_flags: &[String],
+    rows: u16,
+    cols: u16,
 ) -> Result<ClaudeProcess> {
-    let mut cmd = Command::new("claude");
-    cmd.arg("--print")
-        .arg("--verbose")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--allowedTools")
-        .arg(allowed_tools);
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new("claude");
+    cmd.arg(prompt);
+    cmd.arg("--allowedTools");
+    cmd.arg(allowed_tools);
 
     for flag in extra_flags {
         cmd.arg(flag);
     }
 
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-
-    // Write prompt to stdin, then close it
-    if let Some(mut stdin) = child.stdin.take() {
-        let prompt = prompt.to_string();
-        thread::spawn(move || {
-            let _ = stdin.write_all(prompt.as_bytes());
-            // stdin dropped here, closing the pipe
-        });
+    // Set working directory to the current process's cwd
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
     }
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
 
-    let (tx, rx) = mpsc::channel();
+    // Output reader thread
+    let reader = pair.master.try_clone_reader()?;
+    let (out_tx, out_rx) = mpsc::channel();
 
-    // Stdout reader thread — parses stream-json lines
-    let tx_out = tx.clone();
     thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    for display_line in parse_stream_json_line(&line) {
-                        if tx_out.send(display_line).is_err() {
-                            return;
-                        }
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
                     }
                 }
                 Err(_) => break,
@@ -66,129 +67,80 @@ pub fn spawn_claude_print(
         }
     });
 
-    // Stderr reader thread
+    // Input writer thread
+    let writer = pair.master.take_writer()?;
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>();
+
     thread::spawn(move || {
-        let reader = std::io::BufReader::new(stderr);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    let stripped = strip_ansi(&line);
-                    if !stripped.trim().is_empty() {
-                        if tx.send(stripped).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
+        use std::io::Write;
+        let mut writer = writer;
+        while let Ok(bytes) = in_rx.recv() {
+            if writer.write_all(&bytes).is_err() {
+                break;
             }
+            let _ = writer.flush();
         }
     });
 
-    Ok(ClaudeProcess { child, line_rx: rx })
+    Ok(ClaudeProcess {
+        child,
+        byte_rx: out_rx,
+        input_tx: in_tx,
+        _master: pair.master,
+    })
 }
 
-/// Parse a stream-json line and return displayable text lines.
-fn parse_stream_json_line(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return vec![];
-    }
+/// Convert a crossterm KeyEvent into raw terminal bytes for PTY input.
+pub fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    use crossterm::event::{KeyCode, KeyModifiers};
 
-    let value: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => {
-            // Not JSON — show as-is
-            return vec![strip_ansi(trimmed)];
-        }
-    };
-
-    let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    match event_type {
-        "assistant" => {
-            // Extract text content from assistant message
-            extract_assistant_text(&value)
-        }
-        "tool_use" => {
-            let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let input = value.get("input").cloned().unwrap_or(serde_json::Value::Null);
-            let mut lines = vec![format!("> Tool: {name}")];
-            // Show compact tool input summary
-            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                lines.push(format!("  $ {cmd}"));
-            } else if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
-                lines.push(format!("  {path}"));
-            } else if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
-                lines.push(format!("  {pattern}"));
-            }
-            lines
-        }
-        "tool_result" => {
-            // Show abbreviated tool output
-            if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
-                let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
-                let stripped = strip_ansi(&preview);
-                if stripped.trim().is_empty() {
-                    vec![]
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char(c) => {
+                // Ctrl+A = 0x01 .. Ctrl+Z = 0x1A
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() {
+                    Some(vec![lower as u8 - b'a' + 1])
                 } else {
-                    stripped.lines().map(|l| l.to_string()).collect()
-                }
-            } else {
-                vec![]
-            }
-        }
-        "result" => {
-            // Final result — extract text
-            if let Some(result) = value.get("result").and_then(|v| v.as_str()) {
-                let stripped = strip_ansi(result);
-                stripped.lines().map(|l| l.to_string()).collect()
-            } else {
-                vec![]
-            }
-        }
-        // system, ping, etc. — skip
-        _ => vec![],
-    }
-}
-
-/// Extract text content from an assistant message event.
-fn extract_assistant_text(value: &serde_json::Value) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    // Try message.content array
-    if let Some(content) = value
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    {
-        for block in content {
-            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                let stripped = strip_ansi(text);
-                for line in stripped.lines() {
-                    lines.push(line.to_string());
+                    None
                 }
             }
-        }
+            _ => None,
+        };
     }
 
-    // Try top-level content array
-    if lines.is_empty() {
-        if let Some(content) = value.get("content").and_then(|c| c.as_array()) {
-            for block in content {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    let stripped = strip_ansi(text);
-                    for line in stripped.lines() {
-                        lines.push(line.to_string());
-                    }
-                }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return match key.code {
+            KeyCode::Char(c) => {
+                let mut bytes = vec![0x1b]; // ESC prefix
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                bytes.extend_from_slice(s.as_bytes());
+                Some(bytes)
             }
-        }
+            _ => None,
+        };
     }
 
-    lines
-}
-
-fn strip_ansi(s: &str) -> String {
-    let bytes = strip_ansi_escapes::strip(s);
-    String::from_utf8_lossy(&bytes).to_string()
+    match key.code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            Some(s.as_bytes().to_vec())
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        _ => None,
+    }
 }

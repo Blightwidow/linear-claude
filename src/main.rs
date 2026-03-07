@@ -191,19 +191,34 @@ fn run_tui(config: Config, issues: Vec<LinearIssue>, interrupted: Arc<AtomicBool
         }
 
         // Process events
-        let visible_height = tui::ui::output_visible_height(terminal.size().map(|s| s.height).unwrap_or(24));
-
         match events.app_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(event) => {
                 match event {
                     AppEvent::Key(key) => {
-                        if tui::event::handle_key(key, &mut app, &events.cmd_tx, visible_height) {
+                        if app.pty_input_tx.is_some() {
+                            // Claude is running — forward most keys to Claude
+                            use crossterm::event::{KeyCode, KeyModifiers};
+                            match key.code {
+                                // Ctrl+C: quit the TUI
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let _ = events.cmd_tx.send(tui::event::WorkerCommand::Quit);
+                                    app.should_quit = true;
+                                    break;
+                                }
+                                _ => {
+                                    if let Some(bytes) = tui::claude_runner::key_to_bytes(&key) {
+                                        if let Some(tx) = &app.pty_input_tx {
+                                            let _ = tx.send(bytes);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if tui::event::handle_key(key, &mut app, &events.cmd_tx) {
                             break;
                         }
                     }
                     AppEvent::Tick => {}
                     AppEvent::IssueStatusChanged { index, status } => {
-                        // Update counters
                         match &status {
                             IssueDisplayStatus::Done => app.done_count += 1,
                             IssueDisplayStatus::Failed => app.failed_count += 1,
@@ -217,21 +232,28 @@ fn run_tui(config: Config, issues: Vec<LinearIssue>, interrupted: Arc<AtomicBool
                     AppEvent::BranchChanged(branch) => {
                         app.current_branch = branch;
                     }
-                    AppEvent::ClaudeOutput(line) => {
-                        app.push_output_line(line);
+                    AppEvent::PtyBytes(bytes) => {
+                        app.parser.process(&bytes);
                     }
-                    AppEvent::ClaudeFinished(_code) => {}
+                    AppEvent::PtyInputReady(tx) => {
+                        app.pty_input_tx = Some(tx);
+                    }
+                    AppEvent::ClaudeFinished(_code) => {
+                        app.pty_input_tx = None;
+                    }
                     AppEvent::OutputCleared => {
-                        app.clear_output();
+                        app.reset_parser();
                     }
                     AppEvent::LogMessage(msg) => {
                         app.push_log_line(msg.clone());
-                        app.push_output_line(format!("# {msg}"));
+                        // Write log message into the terminal as cyan text
+                        let line = format!("\x1b[36m# {msg}\x1b[0m\r\n");
+                        app.parser.process(line.as_bytes());
                     }
                     AppEvent::WorkerDone => {
                         app.worker_done = true;
-                        app.push_output_line(String::new());
-                        app.push_output_line("--- Worker finished. Press q to exit. ---".into());
+                        let msg = "\r\n\x1b[32m--- All done. Press q to exit. ---\x1b[0m\r\n";
+                        app.parser.process(msg.as_bytes());
                     }
                 }
             }

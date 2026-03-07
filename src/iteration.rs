@@ -6,7 +6,6 @@ use crate::linear::types::{IssueStatus, LinearIssue};
 use crate::prompt;
 use crate::summary::{SummaryEntry, SummaryResult};
 use crate::tui::app::IssueDisplayStatus;
-use crate::tui::claude_runner;
 use crate::tui::event::{AppEvent, WorkerCommand};
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -390,6 +389,7 @@ pub fn headless_loop(config: &Config, issues: &[LinearIssue], state: &mut Iterat
 
 // ---- TUI-mode iteration helpers ----
 
+#[allow(clippy::too_many_arguments)]
 fn execute_single_iteration(
     config: &Config,
     state: &mut IterationState,
@@ -506,8 +506,7 @@ fn execute_single_iteration(
     Ok(())
 }
 
-/// Spawn claude --print, forward output lines as AppEvent::ClaudeOutput,
-/// check for skip/quit commands, and return exit code.
+/// Spawn Claude in a PTY, forward output bytes as events, and wait for exit.
 fn run_claude_with_events(
     prompt: &str,
     allowed_tools: &str,
@@ -517,64 +516,68 @@ fn run_claude_with_events(
     cmd_rx: &mpsc::Receiver<WorkerCommand>,
 ) -> Result<i32> {
     if dry_run {
-        let _ = event_tx.send(AppEvent::ClaudeOutput("(DRY RUN) Would run Claude".into()));
-        let _ = event_tx.send(AppEvent::ClaudeFinished(0));
+        let _ = event_tx.send(AppEvent::LogMessage("(DRY RUN) Would run Claude".into()));
         return Ok(0);
     }
 
-    let mut proc = claude_runner::spawn_claude_print(prompt, allowed_tools, extra_flags)?;
+    // Get approximate terminal dimensions for the PTY
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let pty_cols = (((term_cols as f32) * 0.75) as u16).saturating_sub(2);
+    let pty_rows = term_rows.saturating_sub(3);
+
+    let mut proc = crate::tui::claude_runner::spawn_claude(
+        prompt,
+        allowed_tools,
+        extra_flags,
+        pty_rows,
+        pty_cols,
+    )?;
+
+    let _ = event_tx.send(AppEvent::OutputCleared);
+    let _ = event_tx.send(AppEvent::PtyInputReady(proc.input_tx.clone()));
 
     loop {
-        // Check for worker commands (non-blocking)
+        // Check skip/quit
         match cmd_rx.try_recv() {
             Ok(WorkerCommand::SkipCurrent) | Ok(WorkerCommand::Quit) => {
-                // Kill the child process
                 let _ = proc.child.kill();
                 let _ = proc.child.wait();
-                let _ = event_tx.send(AppEvent::ClaudeFinished(-1));
                 return Ok(-1);
             }
-            Err(_) => {}
+            _ => {}
         }
 
-        // Drain available output lines (non-blocking)
-        let mut got_line = false;
-        loop {
-            match proc.line_rx.try_recv() {
-                Ok(line) => {
-                    got_line = true;
-                    let _ = event_tx.send(AppEvent::ClaudeOutput(line));
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
+        // Forward PTY bytes
+        let mut got_data = false;
+        while let Ok(bytes) = proc.byte_rx.try_recv() {
+            got_data = true;
+            let _ = event_tx.send(AppEvent::PtyBytes(bytes));
         }
 
-        // Check if child has exited
+        // Check child exit
         match proc.child.try_wait() {
             Ok(Some(status)) => {
-                // Drain remaining lines
-                for line in proc.line_rx.try_iter() {
-                    let _ = event_tx.send(AppEvent::ClaudeOutput(line));
+                // Drain remaining bytes
+                for bytes in proc.byte_rx.try_iter() {
+                    let _ = event_tx.send(AppEvent::PtyBytes(bytes));
                 }
-                let code = status.code().unwrap_or(1);
+                let code = if status.success() { 0 } else { 1 };
                 let _ = event_tx.send(AppEvent::ClaudeFinished(code));
                 return Ok(code);
             }
             Ok(None) => {
-                // Still running
-                if !got_line {
+                if !got_data {
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
             Err(e) => {
-                let _ = event_tx.send(AppEvent::ClaudeFinished(1));
                 return Err(e.into());
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_in_review_issue(
     config: &Config,
     _state: &mut IterationState,
@@ -727,18 +730,16 @@ fn verify_commit_and_push(
     }
 
     if let Some(ref branch) = branch_name {
-        if has_commits {
-            if !git::branch_exists_remote(branch)? {
+        if has_commits && !git::branch_exists_remote(branch)? {
+            let _ = event_tx.send(AppEvent::LogMessage(format!(
+                "{iteration_display} Pushing branch..."
+            )));
+            if git::push_branch(branch).is_err() {
+                state.unpushed_branches.push(branch.clone());
+            } else {
                 let _ = event_tx.send(AppEvent::LogMessage(format!(
-                    "{iteration_display} Pushing branch..."
+                    "{iteration_display} Pushed branch: {branch}"
                 )));
-                if git::push_branch(branch).is_err() {
-                    state.unpushed_branches.push(branch.clone());
-                } else {
-                    let _ = event_tx.send(AppEvent::LogMessage(format!(
-                        "{iteration_display} Pushed branch: {branch}"
-                    )));
-                }
             }
         }
     }

@@ -74,7 +74,7 @@ fn check_for_updates_inner() -> Result<()> {
 
     let dir = cache_dir();
     fs::create_dir_all(&dir).ok();
-    if let Ok(mut f) = fs::File::create(&cache_file()) {
+    if let Ok(mut f) = fs::File::create(cache_file()) {
         let _ = writeln!(f, "{}", now_epoch());
         let _ = writeln!(f, "{latest_tag}");
     }
@@ -202,7 +202,7 @@ pub fn cmd_update() -> Result<()> {
 
     let dir = cache_dir();
     fs::create_dir_all(&dir).ok();
-    if let Ok(mut f) = fs::File::create(&cache_file()) {
+    if let Ok(mut f) = fs::File::create(cache_file()) {
         let _ = writeln!(f, "{}", now_epoch());
         let _ = writeln!(f, "{latest_tag}");
     }

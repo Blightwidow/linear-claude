@@ -12,7 +12,11 @@ pub enum AppEvent {
         status: IssueDisplayStatus,
     },
     BranchChanged(Option<String>),
-    ClaudeOutput(String),
+    /// Raw PTY output bytes from Claude
+    PtyBytes(Vec<u8>),
+    /// Claude's PTY input channel is ready — forward keystrokes here
+    PtyInputReady(mpsc::Sender<Vec<u8>>),
+    /// Claude process exited with this code
     ClaudeFinished(i32),
     OutputCleared,
     LogMessage(String),
@@ -44,24 +48,22 @@ impl EventSystem {
         }
     }
 
-    /// Start the input + tick threads. Returns immediately.
+    /// Start the input + tick thread. Returns immediately.
     pub fn start_input_thread(&self) {
         let tx = self.app_tx.clone();
         thread::spawn(move || {
             loop {
-                // Poll with 250ms timeout for ticks
                 match event::poll(Duration::from_millis(250)) {
                     Ok(true) => {
                         if let Ok(Event::Key(key)) = event::read() {
-                            if key.kind == KeyEventKind::Press {
-                                if tx.send(AppEvent::Key(key)).is_err() {
-                                    break;
-                                }
+                            if key.kind == KeyEventKind::Press
+                                && tx.send(AppEvent::Key(key)).is_err()
+                            {
+                                break;
                             }
                         }
                     }
                     Ok(false) => {
-                        // Timeout = tick
                         if tx.send(AppEvent::Tick).is_err() {
                             break;
                         }
@@ -78,10 +80,9 @@ pub fn handle_key(
     key: KeyEvent,
     app: &mut crate::tui::app::App,
     cmd_tx: &mpsc::Sender<WorkerCommand>,
-    visible_height: u16,
 ) -> bool {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let _ = cmd_tx.send(WorkerCommand::Quit);
             app.should_quit = true;
             true
@@ -93,31 +94,6 @@ pub fn handle_key(
         }
         KeyCode::Char('s') => {
             let _ = cmd_tx.send(WorkerCommand::SkipCurrent);
-            false
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.scroll_up(1);
-            false
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.scroll_down(1, visible_height);
-            false
-        }
-        KeyCode::PageUp => {
-            app.scroll_up(visible_height.saturating_sub(2));
-            false
-        }
-        KeyCode::PageDown => {
-            app.scroll_down(visible_height.saturating_sub(2), visible_height);
-            false
-        }
-        KeyCode::End => {
-            app.scroll_to_bottom();
-            false
-        }
-        KeyCode::Home => {
-            app.auto_scroll = false;
-            app.scroll_offset = 0;
             false
         }
         _ => false,
