@@ -56,3 +56,9 @@ CLAUDE.local.md
 *.sw?
 
 .mypy_cache
+
+# Environment variables
+.env
+
+# Added by cargo
+/target
