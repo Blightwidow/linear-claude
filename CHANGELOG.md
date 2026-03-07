@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.0
+
+- chore: bump version (0c5eb3b)
+- fix: release target (455d529)
+- refactor: interactive claude (#1) (09e476f)
+- release: update changelog and checksum for v0.1.1 (f553272)
+
 ## v0.1.1
 
 - fix: release workflow (cce2ffb)
