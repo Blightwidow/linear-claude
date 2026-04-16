@@ -1,5 +1,7 @@
 # Linear Claude
 
+## Use Conductor instead. It's way better 😅
+
 > **Warning:** This project is **experimental** and should be used with caution. It runs Claude Code autonomously on your codebase — review its changes carefully. While it does not use `--dangerously-skip-permissions`, it still creates branches, commits, and pushes code on your behalf.
 >
 > This project is **not affiliated with, endorsed by, or connected to** the [Linear](https://linear.app) team in any way. It is an independent tool that uses the Linear API via the community [Linear CLI](https://github.com/schpet/linear).
